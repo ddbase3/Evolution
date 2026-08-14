@@ -1,0 +1,11 @@
+; Add/merge these sections into the project cnf/config.ini.
+
+[directories]
+; JsonSettingsStore writes to <data>/cnf/settings.json
+data = "/path/to/base3/local"
+
+[evolution]
+workspace = "/path/to/base3"
+git_required = true
+framework_write = false
+agent = "evolution"

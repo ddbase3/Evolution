@@ -1,0 +1,95 @@
+{
+    "connection": {
+        "evolution-llm": {
+            "id": "evolution-llm",
+            "name": "Evolution LLM",
+            "type": "http",
+            "driver": "http",
+            "baseUrl": "",
+            "auth": {
+                "type": "bearer",
+                "headerName": "Authorization",
+                "secret": {
+                    "mode": "env",
+                    "name": "EVOLUTION_LLM_API_KEY"
+                }
+            },
+            "timeoutSeconds": 120,
+            "scope": "global",
+            "enabled": true,
+            "options": []
+        }
+    },
+    "service-llm": {
+        "evolution-llm": {
+            "id": "evolution-llm",
+            "name": "Evolution LLM",
+            "serviceType": "llm",
+            "connection": "evolution-llm",
+            "driver": "openai-compatible-chat",
+            "model": "",
+            "enabled": true,
+            "options": {
+                "temperature": 0.2,
+                "maxTokens": 16000,
+                "topP": 1
+            }
+        }
+    },
+    "agent-component-preset": {
+        "evolution-chat": {
+            "id": "evolution-chat",
+            "label": "Evolution Chat Model",
+            "type": "configuredchatmodelagentresource",
+            "enabled": true,
+            "capabilities": [
+                "chatmodel"
+            ],
+            "config": {
+                "service": {
+                    "mode": "fixed",
+                    "value": "evolution-llm"
+                }
+            },
+            "docks": []
+        },
+        "evolution-workspace": {
+            "id": "evolution-workspace",
+            "label": "Evolution Workspace",
+            "type": "evolutionworkspaceagenttool",
+            "enabled": true,
+            "capabilities": [
+                "tool"
+            ],
+            "config": [],
+            "docks": []
+        }
+    },
+    "tool-profile": {
+        "evolution": {
+            "id": "evolution",
+            "label": "Evolution",
+            "description": "Workspace inspection and approved BASE3 source evolution tools.",
+            "enabled": true,
+            "internal_enabled": true,
+            "mcp_enabled": false,
+            "tools": [
+                "evolution-workspace"
+            ]
+        }
+    },
+    "agent": {
+        "evolution": {
+            "enabled": true,
+            "label": "Evolution",
+            "chatmodel": "evolution-chat",
+            "orchestrator_profile": "deliberate",
+            "tool_profiles": [
+                "evolution"
+            ],
+            "memory_profile": "",
+            "context_profile": "",
+            "system_prompt": ""
+        }
+    }
+}
