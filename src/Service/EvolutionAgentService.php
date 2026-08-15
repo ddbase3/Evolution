@@ -7,6 +7,8 @@ use AssistantFoundation\Dto\AgentExecutionResult;
 use AssistantFoundation\Dto\AgentInteractionRequest;
 use AssistantFoundation\Dto\AgentInteractionResponse;
 use AssistantFoundation\Dto\AgentResume;
+use AssistantFoundation\Dto\AgentResult;
+use AssistantFoundation\Dto\AgentStageTraceEntry;
 use Base3\Api\IContainer;
 use Base3\Settings\Api\ISettingsStore;
 use Base3\State\Api\IStateStore;
@@ -584,10 +586,15 @@ final class EvolutionAgentService {
 			$status = is_scalar($assistant['status'] ?? null)
 				? trim((string)$assistant['status'])
 				: ($agentResult?->getStatus() ?? 'unknown');
-			throw new RuntimeException(
-				'MissionBay agent ' . $phase . ' did not produce a complete final response [' . $warning . ']. '
-				. 'Status: ' . ($status !== '' ? $status : 'unknown') . '. No Evolution change plan was stored.'
-			);
+			$message = 'MissionBay agent ' . $phase . ' did not produce a complete final response [' . $warning . ']. '
+				. 'Status: ' . ($status !== '' ? $status : 'unknown') . '. No Evolution change plan was stored.';
+
+			$partialDetail = $this->getPartialResponseDetail($agentResult);
+			if ($partialDetail !== '') {
+				$message .= ' Detail: ' . $partialDetail;
+			}
+
+			throw new RuntimeException($message);
 		}
 
 		if ($agentResult !== null && !$agentResult->isCompleted()) {
@@ -595,6 +602,51 @@ final class EvolutionAgentService {
 				'MissionBay agent ' . $phase . ' ended with non-terminal status: ' . $agentResult->getStatus() . '.'
 			);
 		}
+	}
+
+	private function getPartialResponseDetail(?AgentResult $agentResult): string {
+		$execution = $agentResult?->getState()->getExecution();
+		if ($execution === null) {
+			return '';
+		}
+
+		$trace = array_reverse($execution->getStageTrace());
+		foreach ($trace as $entry) {
+			if (!$entry instanceof AgentStageTraceEntry) {
+				continue;
+			}
+
+			$metadata = $entry->getMetadata();
+			if (($metadata['recovered_from_model_error'] ?? false) !== true) {
+				continue;
+			}
+
+			$parts = [
+				'stage=' . $entry->getStageName(),
+				'iteration=' . $entry->getIteration()
+			];
+
+			$errorType = trim((string)($metadata['error_type'] ?? ''));
+			if ($errorType !== '') {
+				$parts[] = 'error_type=' . $errorType;
+			}
+
+			$errorMessage = trim((string)($metadata['error_message'] ?? ''));
+			if ($errorMessage !== '') {
+				$parts[] = 'error=' . $errorMessage;
+			}
+
+			$errorCode = $metadata['error_code'] ?? null;
+			if (is_scalar($errorCode) && trim((string)$errorCode) !== '') {
+				$parts[] = 'error_code=' . (string)$errorCode;
+			}
+
+			return implode(', ', $parts);
+		}
+
+		return 'iteration=' . $execution->getIteration()
+			. '/' . $execution->getMaxIterations()
+			. ', executed_tool_calls=' . count($execution->getExecutedToolCalls());
 	}
 
 	/** @param array<string,mixed> $detail */
