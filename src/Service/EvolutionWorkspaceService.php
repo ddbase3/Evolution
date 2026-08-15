@@ -7,6 +7,7 @@ use FilesystemIterator;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use RuntimeException;
+use Throwable;
 
 final class EvolutionWorkspaceService {
 
@@ -21,15 +22,12 @@ final class EvolutionWorkspaceService {
 
 	/** @return array<string,mixed> */
 	public function getWorkspaceInfo(): array {
-		$workspace = $this->requireWorkspace();
-		$git = $this->getGitStatus();
-
 		return [
-			'workspace' => $workspace,
-			'plugin_path' => $workspace . DIRECTORY_SEPARATOR . 'plugin',
-			'framework_write' => $this->configuration->isFrameworkWriteEnabled(),
+			'application_root' => $this->requireWorkspace(),
+			'writable_plugin' => $this->configuration->getWorkspacePlugin(),
+			'writable_root' => $this->configuration->getWorkspacePluginPath(),
 			'git_required' => $this->configuration->isGitRequired(),
-			'git' => $git,
+			'git' => $this->getGitStatus(),
 			'plugins' => $this->classMap->getPlugins()
 		];
 	}
@@ -91,7 +89,6 @@ final class EvolutionWorkspaceService {
 		if ($content === false) {
 			throw new RuntimeException('Unable to read file: ' . $relativePath);
 		}
-
 		if (str_contains($content, "\0")) {
 			throw new RuntimeException('Binary files cannot be read through the Evolution text tool: ' . $relativePath);
 		}
@@ -125,11 +122,7 @@ final class EvolutionWorkspaceService {
 					continue;
 				}
 				$relative = $this->relativePath($item->getPathname());
-				if ($this->isIgnoredPath($relative)) {
-					continue;
-				}
-				$size = $item->getSize();
-				if ($size > self::MAX_READ_BYTES) {
+				if ($this->isIgnoredPath($relative) || $item->getSize() > self::MAX_READ_BYTES) {
 					continue;
 				}
 				$files[] = $item->getPathname();
@@ -177,9 +170,20 @@ final class EvolutionWorkspaceService {
 		if (file_put_contents($temp, $content, LOCK_EX) === false) {
 			throw new RuntimeException('Unable to write temporary file: ' . $this->relativePath($temp));
 		}
-		if (!rename($temp, $target)) {
+
+		try {
+			if (str_ends_with(strtolower($target), '.php')) {
+				$lint = $this->runProcess([PHP_BINARY, '-l', $temp], $this->requireWorkspace());
+				if ($lint['exit_code'] !== 0) {
+					throw new RuntimeException('Generated PHP is not syntactically valid: ' . trim($lint['stdout'] . "\n" . $lint['stderr']));
+				}
+			}
+			if (!rename($temp, $target)) {
+				throw new RuntimeException('Unable to move temporary file to target: ' . $relativePath);
+			}
+		} catch (Throwable $e) {
 			@unlink($temp);
-			throw new RuntimeException('Unable to move temporary file to target: ' . $relativePath);
+			throw $e;
 		}
 
 		return [
@@ -194,8 +198,8 @@ final class EvolutionWorkspaceService {
 	public function deletePath(string $relativePath, bool $recursive = false): array {
 		$target = $this->resolveWritableExistingPath($relativePath);
 		$relative = $this->relativePath($target);
-		if ($relative === 'plugin' || $relative === '') {
-			throw new RuntimeException('Refusing to delete the workspace or complete plugin directory.');
+		if ($relative === $this->configuration->getWorkspacePluginPath()) {
+			throw new RuntimeException('Refusing to delete the EvolutionWorkspace repository root. Delete individual contents instead.');
 		}
 
 		if (is_link($target) || is_file($target)) {
@@ -209,32 +213,16 @@ final class EvolutionWorkspaceService {
 			throw new RuntimeException('Path does not exist: ' . $relativePath);
 		}
 		if (is_dir($target . DIRECTORY_SEPARATOR . '.git') || is_file($target . DIRECTORY_SEPARATOR . '.git')) {
-			throw new RuntimeException('Refusing to delete a Git repository root. Remove repository contents explicitly and keep version control intact: ' . $relative);
+			throw new RuntimeException('Refusing to delete a Git repository root: ' . $relative);
 		}
 
 		$children = iterator_count(new FilesystemIterator($target, FilesystemIterator::SKIP_DOTS));
 		if ($children > 0 && !$recursive) {
 			throw new RuntimeException('Directory is not empty. Set recursive=true to remove it: ' . $relative);
 		}
-
 		if ($recursive) {
-			$iterator = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator($target, FilesystemIterator::SKIP_DOTS),
-				RecursiveIteratorIterator::CHILD_FIRST
-			);
-			foreach ($iterator as $item) {
-				$path = $item->getPathname();
-				if ($item->isLink() || $item->isFile()) {
-					if (!unlink($path)) {
-						throw new RuntimeException('Unable to delete file: ' . $this->relativePath($path));
-					}
-				} elseif (!rmdir($path)) {
-					throw new RuntimeException('Unable to delete directory: ' . $this->relativePath($path));
-				}
-			}
-		}
-
-		if (!rmdir($target)) {
+			$this->removeDirectoryTree($target);
+		} elseif (!rmdir($target)) {
 			throw new RuntimeException('Unable to delete directory: ' . $relative);
 		}
 
@@ -243,61 +231,54 @@ final class EvolutionWorkspaceService {
 
 	/** @return array<string,mixed> */
 	public function getGitStatus(): array {
-		$workspace = $this->requireWorkspace();
+		$repository = $this->getWorkspacePluginDirectory();
 		$root = $this->getGitRoot();
-		if ($root === '' || rtrim($root, DIRECTORY_SEPARATOR) !== rtrim($workspace, DIRECTORY_SEPARATOR)) {
+		if ($root === '' || rtrim($root, DIRECTORY_SEPARATOR) !== rtrim($repository, DIRECTORY_SEPARATOR)) {
 			return [
 				'available' => false,
 				'clean' => false,
 				'root' => $root,
-				'repositories' => [],
-				'unmanaged_plugins' => [],
+				'branch' => '',
+				'head' => '',
 				'output' => '',
-				'error' => 'The configured workspace is not the root of a Git repository.'
+				'error' => 'plugin/EvolutionWorkspace must be its own Git repository.'
 			];
 		}
 
-		$repositories = [];
-		$clean = true;
-		$output = [];
-		foreach ($this->getGitRepositories() as $relative => $repository) {
-			$status = $this->runProcess(['git', 'status', '--porcelain=v1', '--branch'], $repository);
-			$repositoryClean = $status['exit_code'] === 0 && $this->isStatusOutputClean($status['stdout']);
-			$clean = $clean && $repositoryClean;
-			$repositories[$relative] = [
-				'path' => $repository,
-				'head' => $this->getGitHeadForRepository($repository),
-				'clean' => $repositoryClean,
-				'status' => trim($status['stdout']),
+		$status = $this->runProcess(['git', 'status', '--porcelain=v1', '--branch'], $repository);
+		if ($status['exit_code'] !== 0) {
+			return [
+				'available' => false,
+				'clean' => false,
+				'root' => $root,
+				'branch' => '',
+				'head' => '',
+				'output' => trim($status['stdout']),
 				'error' => trim($status['stderr'])
 			];
-			if (trim($status['stdout']) !== '') {
-				$output[] = '[' . $relative . "]\n" . trim($status['stdout']);
-			}
 		}
 
-		$unmanaged = $this->getUnmanagedPluginDirectories();
-		if ($unmanaged !== []) {
-			$clean = false;
-		}
+		$branchResult = $this->runProcess(['git', 'branch', '--show-current'], $repository);
+		$head = $this->getGitHeadForRepository($repository);
 
 		return [
 			'available' => true,
-			'clean' => $clean,
+			'clean' => $this->isStatusOutputClean($status['stdout']),
 			'root' => $root,
-			'repositories' => $repositories,
-			'unmanaged_plugins' => $unmanaged,
-			'output' => implode("\n\n", $output),
-			'error' => ''
+			'branch' => $branchResult['exit_code'] === 0 ? trim($branchResult['stdout']) : '',
+			'head' => $head,
+			'output' => trim($status['stdout']),
+			'error' => trim($status['stderr'])
 		];
 	}
 
 	public function getGitHead(): string {
-		return $this->getGitHeadForRepository($this->requireWorkspace());
+		return $this->getGitHeadForRepository($this->getWorkspacePluginDirectory());
 	}
 
 	public function getGitRoot(): string {
-		$result = $this->runProcess(['git', 'rev-parse', '--show-toplevel'], $this->requireWorkspace());
+		$repository = $this->getWorkspacePluginDirectory();
+		$result = $this->runProcess(['git', 'rev-parse', '--show-toplevel'], $repository);
 		if ($result['exit_code'] !== 0) {
 			return '';
 		}
@@ -373,105 +354,89 @@ final class EvolutionWorkspaceService {
 	public function createGitSnapshot(): array {
 		$status = $this->getGitStatus();
 		if (($status['available'] ?? false) !== true) {
-			throw new RuntimeException('Unable to create Git snapshot: ' . (string)($status['error'] ?? 'Git unavailable.'));
+			throw new RuntimeException('Unable to create EvolutionWorkspace Git snapshot: ' . (string)($status['error'] ?? 'Git unavailable.'));
 		}
-		if (($status['unmanaged_plugins'] ?? []) !== []) {
-			throw new RuntimeException('Unable to create safe Git snapshot because plugin directories are not version controlled: ' . implode(', ', $status['unmanaged_plugins']));
+		if (($status['clean'] ?? false) !== true) {
+			throw new RuntimeException('EvolutionWorkspace Git repository must be clean before Apply.');
 		}
-
-		$repositories = [];
-		foreach ($status['repositories'] ?? [] as $relative => $repository) {
-			$head = trim((string)($repository['head'] ?? ''));
-			if ($head === '') {
-				throw new RuntimeException('Git repository has no HEAD revision: ' . $relative);
-			}
-			$repositories[(string)$relative] = $head;
+		$head = trim((string)($status['head'] ?? ''));
+		if ($head === '') {
+			throw new RuntimeException('EvolutionWorkspace Git repository has no HEAD revision. Create the initial commit before Apply.');
 		}
 
 		return [
-			'repositories' => $repositories,
-			'plugin_directories' => $this->getPluginDirectories()
+			'repository' => $this->configuration->getWorkspacePluginPath(),
+			'head' => $head,
+			'branch' => (string)($status['branch'] ?? '')
 		];
 	}
 
 	/** @param array<string,mixed> $snapshot */
 	public function assertGitSnapshot(array $snapshot): void {
-		$expectedRepositories = is_array($snapshot['repositories'] ?? null) ? $snapshot['repositories'] : [];
-		if ($expectedRepositories === []) {
-			throw new RuntimeException('Approved change has no Git repository snapshot. Re-run analysis.');
+		$expectedHead = $this->getSnapshotHead($snapshot);
+		$status = $this->getGitStatus();
+		if (($status['available'] ?? false) !== true) {
+			throw new RuntimeException('EvolutionWorkspace Git repository is no longer available. Re-run analysis.');
 		}
-
-		$current = $this->getGitStatus();
-		if (($current['available'] ?? false) !== true) {
-			throw new RuntimeException('Git repository structure is no longer available. Re-run analysis.');
+		if (trim((string)($status['head'] ?? '')) !== $expectedHead) {
+			throw new RuntimeException('EvolutionWorkspace Git HEAD changed since the accepted snapshot. Re-run analysis.');
 		}
-		if (($current['unmanaged_plugins'] ?? []) !== []) {
-			throw new RuntimeException('Unversioned plugin directories are present: ' . implode(', ', $current['unmanaged_plugins']));
-		}
-
-		$currentRepositories = is_array($current['repositories'] ?? null) ? $current['repositories'] : [];
-		if (array_keys($currentRepositories) !== array_keys($expectedRepositories)) {
-			throw new RuntimeException('Git repository composition changed since analysis. Re-run analysis.');
-		}
-		foreach ($expectedRepositories as $relative => $head) {
-			$currentHead = trim((string)($currentRepositories[$relative]['head'] ?? ''));
-			if ($currentHead !== trim((string)$head)) {
-				throw new RuntimeException('Git HEAD changed since analysis for ' . $relative . '. Re-run analysis.');
-			}
-			if (($currentRepositories[$relative]['clean'] ?? false) !== true) {
-				throw new RuntimeException('Git working tree is not clean: ' . $relative . '. Commit or discard existing changes before Apply.');
-			}
+		if (($status['clean'] ?? false) !== true) {
+			throw new RuntimeException('EvolutionWorkspace Git working tree is not clean. Commit or discard existing changes before Apply.');
 		}
 	}
 
-	public function getGitDiff(): string {
-		$sections = [];
-		foreach ($this->getGitRepositories() as $relative => $repository) {
-			$diff = $this->runProcess(['git', 'diff', '--no-ext-diff', '--no-color'], $repository);
-			if ($diff['exit_code'] !== 0) {
-				throw new RuntimeException('Git diff failed for ' . $relative . ': ' . trim($diff['stderr']));
-			}
-			$untracked = $this->getUntrackedPathsForRepository($repository, $relative);
-			$content = trim($diff['stdout']);
-			if ($untracked !== []) {
-				$content .= ($content !== '' ? "\n\n" : '') . "Untracked files:\n" . implode("\n", array_map(static fn(string $path): string => '+ ' . $path, $untracked));
-			}
-			if ($content !== '') {
-				$sections[] = 'Repository ' . $relative . ":\n" . $content;
-			}
+	public function getGitDiff(?string $baseHead = null): string {
+		$repository = $this->getWorkspacePluginDirectory();
+		$args = ['git', 'diff', '--no-ext-diff', '--no-color'];
+		if ($baseHead !== null && trim($baseHead) !== '') {
+			$args[] = trim($baseHead);
+		}
+		$args[] = '--';
+		$args[] = '.';
+		$diff = $this->runProcess($args, $repository);
+		if ($diff['exit_code'] !== 0) {
+			throw new RuntimeException('EvolutionWorkspace Git diff failed: ' . trim($diff['stderr']));
 		}
 
-		$unmanaged = $this->getUnmanagedPluginDirectories();
-		foreach ($unmanaged as $plugin) {
-			$files = $this->listFiles($plugin, 12, 2000);
-			$sections[] = 'New/unversioned plugin tree ' . $plugin . ":\n" . implode("\n", array_map(static fn(string $path): string => '+ ' . $path, $files));
+		$untracked = $this->getUntrackedPathsForRepository($repository);
+		$content = trim($diff['stdout']);
+		if ($untracked !== []) {
+			$content .= ($content !== '' ? "\n\n" : '') . "Untracked files:\n" . implode("\n", array_map(
+				fn(string $path): string => '+ ' . $this->configuration->getWorkspacePluginPath() . '/' . $path,
+				$untracked
+			));
 		}
 
-		return $this->limitText(implode("\n\n", $sections), self::MAX_PROCESS_OUTPUT_BYTES);
+		return $this->limitText($content, self::MAX_PROCESS_OUTPUT_BYTES);
 	}
 
 	/** @return array<int,string> */
-	public function getChangedPaths(): array {
-		$result = [];
-		foreach ($this->getGitRepositories() as $relative => $repository) {
-			$tracked = $this->runProcess(['git', 'diff', '--name-only', 'HEAD'], $repository);
-			$paths = $tracked['exit_code'] === 0 ? preg_split('/\R/', trim($tracked['stdout'])) : [];
-			$paths = is_array($paths) ? $paths : [];
-			$paths = array_merge($paths, $this->getUntrackedPathsForRepository($repository, $relative, false));
-			foreach ($paths as $path) {
-				$path = trim((string)$path);
-				if ($path === '') continue;
-				$workspacePath = $relative === '.' ? $path : $relative . '/' . $path;
-				$result[$workspacePath] = $workspacePath;
-			}
+	public function getChangedPaths(?string $baseHead = null): array {
+		$repository = $this->getWorkspacePluginDirectory();
+		$args = ['git', 'diff', '--name-only'];
+		if ($baseHead !== null && trim($baseHead) !== '') {
+			$args[] = trim($baseHead);
+		} else {
+			$args[] = 'HEAD';
+		}
+		$args[] = '--';
+		$args[] = '.';
+		$tracked = $this->runProcess($args, $repository);
+		if ($tracked['exit_code'] !== 0) {
+			throw new RuntimeException('Unable to determine changed EvolutionWorkspace paths: ' . trim($tracked['stderr']));
 		}
 
-		foreach ($this->getUnmanagedPluginDirectories() as $plugin) {
-			foreach ($this->listFiles($plugin, 12, 2000) as $path) {
-				if (!str_ends_with($path, '/')) {
-					$result[$path] = $path;
-				}
+		$paths = preg_split('/\R/', trim($tracked['stdout'])) ?: [];
+		$paths = array_merge($paths, $this->getUntrackedPathsForRepository($repository));
+		$result = [];
+		foreach ($paths as $path) {
+			$path = trim((string)$path);
+			if ($path === '') {
+				continue;
 			}
+			$workspacePath = $this->configuration->getWorkspacePluginPath() . '/' . str_replace('\\', '/', $path);
+			$result[$workspacePath] = $workspacePath;
 		}
 
 		ksort($result);
@@ -479,10 +444,10 @@ final class EvolutionWorkspaceService {
 	}
 
 	/** @return array<string,mixed> */
-	public function validateChangedPhp(): array {
+	public function validateChangedPhp(?string $baseHead = null): array {
 		$workspace = $this->requireWorkspace();
 		$files = array_values(array_filter(
-			$this->getChangedPaths(),
+			$this->getChangedPaths($baseHead),
 			static fn(string $path): bool => str_ends_with(strtolower($path), '.php')
 				&& is_file($workspace . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path))
 		));
@@ -512,23 +477,31 @@ final class EvolutionWorkspaceService {
 	public function refreshClassMap(): array {
 		try {
 			$this->classMap->generate(true);
-			return ['ok' => true, 'message' => 'Class map regenerated successfully.'];
-		} catch (\Throwable $e) {
-			return ['ok' => false, 'message' => $e->getMessage(), 'type' => get_class($e)];
+			return ['ok' => true, 'message' => 'BASE3 class map regenerated successfully.'];
+		} catch (Throwable $e) {
+			return ['ok' => false, 'message' => $e->getMessage(), 'type' => $e::class];
 		}
 	}
 
 	/** @return array<string,mixed> */
 	public function runTests(): array {
 		$workspace = $this->requireWorkspace();
-		$vendorPhpunit = $workspace . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'phpunit';
+		$testDirectory = $this->getWorkspacePluginDirectory() . DIRECTORY_SEPARATOR . 'test';
+		if (!is_dir($testDirectory)) {
+			return [
+				'ok' => true,
+				'skipped' => true,
+				'message' => 'EvolutionWorkspace has no test directory. Test execution skipped.'
+			];
+		}
 
+		$vendorPhpunit = $workspace . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'phpunit';
 		if (is_file($vendorPhpunit)) {
-			$command = [PHP_BINARY, $vendorPhpunit, '--colors=never'];
+			$command = [PHP_BINARY, $vendorPhpunit, '--colors=never', $testDirectory];
 		} elseif (is_executable('/usr/local/bin/phpunit')) {
-			$command = ['/usr/local/bin/phpunit', '--colors=never'];
+			$command = ['/usr/local/bin/phpunit', '--colors=never', $testDirectory];
 		} elseif (is_executable('/usr/bin/phpunit')) {
-			$command = ['/usr/bin/phpunit', '--colors=never'];
+			$command = ['/usr/bin/phpunit', '--colors=never', $testDirectory];
 		} else {
 			return [
 				'ok' => true,
@@ -548,50 +521,26 @@ final class EvolutionWorkspaceService {
 
 	/** @param array<string,mixed> $snapshot @return array<string,mixed> */
 	public function rollbackToSnapshot(array $snapshot): array {
-		$repositories = is_array($snapshot['repositories'] ?? null) ? $snapshot['repositories'] : [];
-		if ($repositories === []) {
-			return ['ok' => false, 'message' => 'Rollback refused because the accepted Git snapshot is missing.'];
+		try {
+			$head = $this->getSnapshotHead($snapshot);
+		} catch (Throwable $e) {
+			return ['ok' => false, 'message' => $e->getMessage()];
 		}
 
-		$output = [];
-		foreach ($repositories as $relative => $expectedHead) {
-			$repository = $relative === '.'
-				? $this->requireWorkspace()
-				: $this->requireWorkspace() . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, (string)$relative);
-			if (!is_dir($repository)) {
-				return ['ok' => false, 'message' => 'Rollback refused because repository directory is missing: ' . $relative];
-			}
-			$currentHead = $this->getGitHeadForRepository($repository);
-			if ($currentHead !== trim((string)$expectedHead)) {
-				return ['ok' => false, 'message' => 'Rollback refused because Git HEAD changed for ' . $relative . '.'];
-			}
-			$reset = $this->runProcess(['git', 'reset', '--hard', (string)$expectedHead], $repository);
-			if ($reset['exit_code'] !== 0) {
-				return ['ok' => false, 'message' => 'Git reset failed for ' . $relative . ': ' . trim($reset['stderr'])];
-			}
-			$clean = $this->runProcess(['git', 'clean', '-fd'], $repository);
-			if ($clean['exit_code'] !== 0) {
-				return ['ok' => false, 'message' => 'Git clean failed for ' . $relative . ': ' . trim($clean['stderr'])];
-			}
-			$output[] = '[' . $relative . '] ' . trim($reset['stdout'] . "\n" . $clean['stdout']);
+		$repository = $this->getWorkspacePluginDirectory();
+		$reset = $this->runProcess(['git', 'reset', '--hard', $head], $repository);
+		if ($reset['exit_code'] !== 0) {
+			return ['ok' => false, 'message' => 'EvolutionWorkspace Git reset failed: ' . trim($reset['stderr'])];
 		}
-
-		$beforePlugins = is_array($snapshot['plugin_directories'] ?? null) ? $snapshot['plugin_directories'] : [];
-		$beforePlugins = array_fill_keys(array_map('strval', $beforePlugins), true);
-		foreach ($this->getPluginDirectories() as $plugin) {
-			if (isset($beforePlugins[$plugin])) continue;
-			$absolute = $this->requireWorkspace() . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $plugin);
-			if (is_dir($absolute . DIRECTORY_SEPARATOR . '.git')) {
-				return ['ok' => false, 'message' => 'Rollback refused to remove newly created Git repository automatically: ' . $plugin];
-			}
-			$this->removeDirectoryTree($absolute);
-			$output[] = '[new plugin removed] ' . $plugin;
+		$clean = $this->runProcess(['git', 'clean', '-fd'], $repository);
+		if ($clean['exit_code'] !== 0) {
+			return ['ok' => false, 'message' => 'EvolutionWorkspace Git clean failed: ' . trim($clean['stderr'])];
 		}
 
 		return [
 			'ok' => true,
-			'message' => 'Workspace repositories restored to the accepted revisions.',
-			'output' => trim(implode("\n", $output))
+			'message' => 'EvolutionWorkspace restored to the accepted revision.',
+			'output' => trim($reset['stdout'] . "\n" . $clean['stdout'])
 		];
 	}
 
@@ -609,9 +558,18 @@ final class EvolutionWorkspaceService {
 		}
 		$workspace = realpath($configured);
 		if (!is_string($workspace) || !is_dir($workspace)) {
-			throw new RuntimeException('Evolution workspace does not exist or is not a directory: ' . $configured);
+			throw new RuntimeException('Evolution application root does not exist or is not a directory: ' . $configured);
 		}
 		return rtrim($workspace, DIRECTORY_SEPARATOR);
+	}
+
+	private function getWorkspacePluginDirectory(): string {
+		$path = $this->requireWorkspace() . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $this->configuration->getWorkspacePluginPath());
+		$real = realpath($path);
+		if (!is_string($real) || !is_dir($real)) {
+			throw new RuntimeException('EvolutionWorkspace plugin directory does not exist: ' . $path);
+		}
+		return rtrim($real, DIRECTORY_SEPARATOR);
 	}
 
 	private function normalizeRelativePath(string $relativePath): string {
@@ -645,7 +603,7 @@ final class EvolutionWorkspaceService {
 		$candidate = $relative === '' ? $workspace : $workspace . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
 		$path = realpath($candidate);
 		if (!is_string($path) || !$this->isInside($path, $workspace)) {
-			throw new RuntimeException('Path does not exist inside the Evolution workspace: ' . $relativePath);
+			throw new RuntimeException('Path does not exist inside the Evolution application root: ' . $relativePath);
 		}
 		if (!$allowDirectory && is_dir($path)) {
 			throw new RuntimeException('Expected a file but received a directory: ' . $relativePath);
@@ -654,11 +612,9 @@ final class EvolutionWorkspaceService {
 	}
 
 	private function resolveWritableExistingPath(string $relativePath): string {
-		$workspace = $this->requireWorkspace();
 		$relative = $this->normalizeRelativePath($relativePath);
-		$candidate = $relative === ''
-			? $workspace
-			: $workspace . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+		$this->assertWriteAllowed($relative);
+		$candidate = $this->requireWorkspace() . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
 		if (is_link($candidate)) {
 			throw new RuntimeException('Evolution does not modify or delete symbolic links: ' . $relativePath);
 		}
@@ -687,7 +643,7 @@ final class EvolutionWorkspaceService {
 		}
 		$ancestorReal = realpath($ancestor);
 		if (!is_string($ancestorReal) || !$this->isInside($ancestorReal, $workspace)) {
-			throw new RuntimeException('Target path escapes the Evolution workspace: ' . $relativePath);
+			throw new RuntimeException('Target path escapes the Evolution application root: ' . $relativePath);
 		}
 		$this->assertWriteAllowed($this->relativePath($ancestorReal));
 
@@ -697,7 +653,7 @@ final class EvolutionWorkspaceService {
 		if (file_exists($candidate)) {
 			$existing = realpath($candidate);
 			if (!is_string($existing) || !$this->isInside($existing, $workspace)) {
-				throw new RuntimeException('Target path resolves outside the Evolution workspace: ' . $relativePath);
+				throw new RuntimeException('Target path resolves outside the Evolution application root: ' . $relativePath);
 			}
 			$this->assertWriteAllowed($this->relativePath($existing));
 			if (is_dir($existing)) {
@@ -710,15 +666,15 @@ final class EvolutionWorkspaceService {
 	}
 
 	private function assertWriteAllowed(string $relativePath): void {
-		$relativePath = str_replace('\\', '/', ltrim($relativePath, '/'));
-		$segments = explode('/', trim($relativePath, '/'));
+		$relativePath = str_replace('\\', '/', trim($relativePath, '/'));
+		$segments = explode('/', $relativePath);
 		if (in_array('.git', $segments, true)) {
 			throw new RuntimeException('Evolution never writes directly to .git.');
 		}
-		if (!$this->configuration->isFrameworkWriteEnabled()) {
-			if ($relativePath !== 'plugin' && !str_starts_with($relativePath, 'plugin/')) {
-				throw new RuntimeException('Framework write is disabled. Writable paths must be inside plugin/.');
-			}
+
+		$root = $this->configuration->getWorkspacePluginPath();
+		if ($relativePath !== $root && !str_starts_with($relativePath, $root . '/')) {
+			throw new RuntimeException('Evolution source mutation is restricted to ' . $root . '/.');
 		}
 	}
 
@@ -729,7 +685,7 @@ final class EvolutionWorkspaceService {
 			return '';
 		}
 		if (!$this->isInside($path, $workspace)) {
-			throw new RuntimeException('Path is outside the Evolution workspace.');
+			throw new RuntimeException('Path is outside the Evolution application root.');
 		}
 		return str_replace(DIRECTORY_SEPARATOR, '/', substr($path, strlen($workspace) + 1));
 	}
@@ -819,68 +775,13 @@ final class EvolutionWorkspaceService {
 	private function isStatusOutputClean(string $output): bool {
 		$lines = preg_split('/\R/', trim($output)) ?: [];
 		foreach ($lines as $line) {
-			if ($line === '' || str_starts_with($line, '## ')) {
+			$line = trim($line);
+			if ($line === '' || str_starts_with($line, '##')) {
 				continue;
 			}
 			return false;
 		}
 		return true;
-	}
-
-	/** @return array<string,string> */
-	private function getGitRepositories(): array {
-		$workspace = $this->requireWorkspace();
-		$repositories = ['.' => $workspace];
-		$pluginRoot = $workspace . DIRECTORY_SEPARATOR . 'plugin';
-		if (!is_dir($pluginRoot)) {
-			return $repositories;
-		}
-
-		$entries = scandir($pluginRoot) ?: [];
-		foreach ($entries as $entry) {
-			if ($entry === '.' || $entry === '..' || str_starts_with($entry, '.')) continue;
-			$directory = $pluginRoot . DIRECTORY_SEPARATOR . $entry;
-			if (!is_dir($directory)) continue;
-			$result = $this->runProcess(['git', 'rev-parse', '--show-toplevel'], $directory);
-			if ($result['exit_code'] !== 0) continue;
-			$root = realpath(trim($result['stdout']));
-			$directoryReal = realpath($directory);
-			if (is_string($root) && is_string($directoryReal) && $root === $directoryReal) {
-				$repositories['plugin/' . $entry] = $directoryReal;
-			}
-		}
-		ksort($repositories);
-		return $repositories;
-	}
-
-	/** @return array<int,string> */
-	private function getPluginDirectories(): array {
-		$workspace = $this->requireWorkspace();
-		$pluginRoot = $workspace . DIRECTORY_SEPARATOR . 'plugin';
-		if (!is_dir($pluginRoot)) return [];
-		$result = [];
-		foreach (scandir($pluginRoot) ?: [] as $entry) {
-			if ($entry === '.' || $entry === '..' || str_starts_with($entry, '.')) continue;
-			if (is_dir($pluginRoot . DIRECTORY_SEPARATOR . $entry)) {
-				$result[] = 'plugin/' . $entry;
-			}
-		}
-		sort($result);
-		return $result;
-	}
-
-	/** @return array<int,string> */
-	private function getUnmanagedPluginDirectories(): array {
-		$workspace = $this->requireWorkspace();
-		$repositories = $this->getGitRepositories();
-		$result = [];
-		foreach ($this->getPluginDirectories() as $plugin) {
-			if (isset($repositories[$plugin])) continue;
-			$tracked = $this->runProcess(['git', 'ls-files', '--', $plugin], $workspace);
-			if ($tracked['exit_code'] === 0 && trim($tracked['stdout']) !== '') continue;
-			$result[] = $plugin;
-		}
-		return $result;
 	}
 
 	private function getGitHeadForRepository(string $repository): string {
@@ -889,29 +790,33 @@ final class EvolutionWorkspaceService {
 	}
 
 	/** @return array<int,string> */
-	private function getUntrackedPathsForRepository(string $repository, string $prefix, bool $workspacePaths = true): array {
+	private function getUntrackedPathsForRepository(string $repository): array {
 		$result = $this->runProcess(['git', 'ls-files', '--others', '--exclude-standard'], $repository);
-		if ($result['exit_code'] !== 0) return [];
-		$paths = preg_split('/\R/', trim($result['stdout'])) ?: [];
-		$out = [];
-		foreach ($paths as $path) {
-			$path = trim((string)$path);
-			if ($path === '') continue;
-			$out[] = $workspacePaths && $prefix !== '.' ? $prefix . '/' . $path : $path;
+		if ($result['exit_code'] !== 0) {
+			return [];
 		}
-		return $out;
+		$paths = preg_split('/\R/', trim($result['stdout'])) ?: [];
+		$resultPaths = [];
+		foreach ($paths as $path) {
+			$path = trim($path);
+			if ($path !== '') {
+				$resultPaths[$path] = $path;
+			}
+		}
+		ksort($resultPaths);
+		return array_values($resultPaths);
+	}
+
+	/** @param array<string,mixed> $snapshot */
+	private function getSnapshotHead(array $snapshot): string {
+		$head = trim((string)($snapshot['head'] ?? ''));
+		if ($head === '') {
+			throw new RuntimeException('Accepted EvolutionWorkspace Git snapshot has no HEAD revision.');
+		}
+		return $head;
 	}
 
 	private function removeDirectoryTree(string $directory): void {
-		$workspace = $this->requireWorkspace();
-		$realParent = realpath(dirname($directory));
-		if (!is_string($realParent) || !$this->isInside($realParent, $workspace)) {
-			throw new RuntimeException('Refusing to remove directory outside Evolution workspace: ' . $directory);
-		}
-		if (is_link($directory)) {
-			throw new RuntimeException('Refusing to remove symbolic link directory during rollback: ' . $directory);
-		}
-		if (!is_dir($directory)) return;
 		$iterator = new RecursiveIteratorIterator(
 			new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
 			RecursiveIteratorIterator::CHILD_FIRST
@@ -919,12 +824,16 @@ final class EvolutionWorkspaceService {
 		foreach ($iterator as $item) {
 			$path = $item->getPathname();
 			if ($item->isLink() || $item->isFile()) {
-				if (!unlink($path)) throw new RuntimeException('Rollback could not remove file: ' . $path);
+				if (!unlink($path)) {
+					throw new RuntimeException('Unable to delete file: ' . $this->relativePath($path));
+				}
 			} elseif (!rmdir($path)) {
-				throw new RuntimeException('Rollback could not remove directory: ' . $path);
+				throw new RuntimeException('Unable to delete directory: ' . $this->relativePath($path));
 			}
 		}
-		if (!rmdir($directory)) throw new RuntimeException('Rollback could not remove directory: ' . $directory);
+		if (!rmdir($directory)) {
+			throw new RuntimeException('Unable to delete directory: ' . $this->relativePath($directory));
+		}
 	}
 
 	private function limitText(string $text, int $maxLength): string {

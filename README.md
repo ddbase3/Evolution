@@ -1,6 +1,12 @@
 # Evolution
 
-Evolution is a BASE3/MissionBay prototype for inspecting and evolving the current BASE3 application through a controlled agent workflow.
+Evolution is the BASE3/MissionBay development agent for the current BASE3 application.
+
+The application root remains the configured Evolution workspace for read access. The only writable source target is the dedicated normal BASE3 plugin:
+
+`plugin/EvolutionWorkspace`
+
+Evolution itself, MissionBay, Website, Foundations and BASE3 framework source are read-only reference material for the agent.
 
 ## Runtime
 
@@ -8,7 +14,7 @@ Open the UI through the normal BASE3 output route:
 
 `?name=evolutiondisplay&out=html`
 
-The UI performs a self-check before analysis or apply is enabled.
+Analysis is read-only. Apply uses MissionBay approval before concrete mutation tools execute.
 
 ## Configuration
 
@@ -21,72 +27,52 @@ data = "/srv/www/html/misc/evolution/local"
 [evolution]
 workspace = "/srv/www/html/misc/evolution"
 git_required = true
-framework_write = false
 agent = "evolution"
 ```
 
-MissionBay settings stay in the normal `ISettingsStore`. With the Website composition in this package that is `JsonSettingsStore`, stored at:
+`framework_write` is no longer used. Source mutation is always restricted to `plugin/EvolutionWorkspace`.
+
+MissionBay settings stay in `ISettingsStore`, normally:
 
 `<directories.data>/cnf/settings.json`
 
-## OpenAI baseline
+The bundled settings examples provide the `evolution` agent, `evolution-workspace` tool preset and a dedicated governed orchestrator profile with 32 tool loops and native model decision.
 
-`plugin/Evolution/local/settings.json.example` contains a complete native OpenAI baseline:
+## EvolutionWorkspace repository
 
-- connection type: `http`
-- connection driver: `http`
-- base URL: `https://api.openai.com`
-- service driver: `openai-chat`
-- model: `gpt-4.1`
-- chat model preset: `evolution-chat`
-- tool profile: `evolution`
-- agent: `evolution`
-- custom MissionBay orchestrator profile: `evolution` (`governed`, 32 tool loops, native model decision)
+`plugin/EvolutionWorkspace` is intentionally an ordinary BASE3 plugin and the complete writable area for the agent. It should be its own Git repository, just like the other independently versioned plugins in this installation.
 
-Copy the settings file:
+After installing the initial plugin files, initialize the repository with the deployment identity used for this plugin:
 
 ```bash
-mkdir -p local/cnf local/secret
-cp plugin/Evolution/local/settings.json.example local/cnf/settings.json
+cd plugin/EvolutionWorkspace
+git init
+git add .
+git commit -m "feat: initialize evolution workspace"
 ```
 
-Store only the API key in the configured secret file:
+The PHP process must be able to write the EvolutionWorkspace working tree and its `.git` metadata because approved Apply operations write files and failed validation performs a local Git rollback. The self-check verifies both requirements.
 
-```bash
-printf '%s' 'YOUR_OPENAI_API_KEY' > local/secret/openai.key
-chmod 600 local/secret/openai.key
-```
-
-The secret uses the existing BASE3 ConfigValue `file` mode. If the PHP process runs under another user, make the file readable by that user without making it publicly readable.
-
-For vLLM or another OpenAI-compatible server use:
-
-`plugin/Evolution/local/settings.openai-compatible.json.example`
-
-and configure its endpoint root and provider model id.
-
-Evolution uses a dedicated MissionBay orchestrator profile instead of the built-in `deliberate` profile. The built-in deliberate profile is intentionally limited to four tool loops, which is too small for repository analysis. The bundled `agent-orchestrator-profile/evolution` uses MissionBay's existing `governed` mode with `max_tool_loops = 32` and `native-model-decision`. Native model decision reuses the terminal tool-loop model response directly and avoids a second final-response model call. MissionBay does not allow native model decision together with semantic verification, so the bundled profile disables only that optional stage while keeping governed approval and the remaining pipeline intact.
-
-## Self-check readiness
-
-Analysis and Apply deliberately have different requirements.
-
-Analysis requires readable source, valid settings, a resolvable LLM/agent flow, database access, StateStore and the Evolution prompt. It does not require writable source or Git-safe mutation state.
-
-Apply additionally requires the configured write scope and, when `git_required=true`, a clean Git repository for the BASE3 workspace and clean version-controlled plugin repositories.
-
-A read-only `local/cnf` is reported as a warning when an existing settings file can already be loaded. It does not block analysis or source Apply because Evolution does not need to rewrite its agent settings during a change.
+When `git_required=true`, Apply requires this repository to have an initial commit and a clean working tree. Dirty state in other BASE3/plugin repositories does not block Evolution because those repositories are read-only to the agent.
 
 ## Safety boundary
 
-Analysis is read-only. Source mutation tools reject calls unless the run context is explicit Apply mode. Apply additionally requires the configured write scope and, when `git_required=true`, a clean Git repository for the BASE3 workspace and clean version-controlled plugin repositories. BASE3 normally ignores `plugin/*` in the framework repository, so installed plugins should remain their own Git repositories. Existing unversioned plugin directories block Apply with an explicit self-check error. A newly generated plugin may be created during one approved Apply; after success it must be initialized/committed as a plugin repository before the next Apply.
+Evolution may read the complete configured application root so it can inspect BASE3 contracts and existing implementation patterns. Mutation tools enforce this single source boundary:
 
-When `framework_write=false`, source writes are restricted to `plugin/`.
+`plugin/EvolutionWorkspace/**`
 
-Evolution never exposes arbitrary shell execution or arbitrary SQL. Database schema changes must be implemented as normal BASE3 migrations.
+Direct `.git` file access, arbitrary shell execution and arbitrary schema-changing SQL are not exposed.
 
-## Analysis snapshot semantics
+PHP writes are syntax-checked before the temporary file replaces the target file. After Apply, Evolution validates changed PHP, regenerates the BASE3 ClassMap and runs the `EvolutionWorkspace/test` PHPUnit directory when present. Failed validation restores the EvolutionWorkspace Git repository to the accepted revision.
 
-Analysis never requires a Git-safe mutation state. It records a read-only fingerprint of framework/plugin source and `cnf/config.ini` together with the plan.
+## Analysis behavior
 
-Apply first verifies that this source fingerprint is still identical. Only after that check, and only when Apply readiness is satisfied, Evolution creates the Git snapshot used for mutation rollback. Creating or restoring `.git` metadata between Analysis and Apply therefore does not invalidate an approved plan, while changing application source does.
+The agent is instructed to start with `plugin/EvolutionWorkspace`, search before broad directory listing, and inspect framework/plugins/settings/database only when the requested change depends on them. This keeps small changes small and avoids consuming repository-wide context for simple tasks.
+
+The source fingerprint still covers relevant application source so an approved plan is invalidated when its reference implementation changes between Analysis and Apply.
+
+## OpenAI baseline
+
+`plugin/Evolution/local/settings.json.example` contains the native OpenAI baseline. `settings.openai-compatible.json.example` can be used for compatible providers.
+
+Store credentials through the existing BASE3 ConfigValue mechanisms; never place secrets in agent-readable source files.

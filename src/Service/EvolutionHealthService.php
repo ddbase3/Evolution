@@ -59,25 +59,20 @@ final class EvolutionHealthService {
 		$this->runCheck($checks, 'write_scope', 'Write scope', function(): array {
 			$workspace = realpath($this->configuration->getWorkspace());
 			if (!is_string($workspace)) {
-				throw new RuntimeException('Workspace must be valid before write permissions can be checked.');
+				throw new RuntimeException('Application root must be valid before write permissions can be checked.');
 			}
-			$target = $this->configuration->isFrameworkWriteEnabled()
-				? $workspace
-				: $workspace . DIRECTORY_SEPARATOR . 'plugin';
+			$target = $workspace . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $this->configuration->getWorkspacePluginPath());
 			if (!is_dir($target)) {
-				throw new RuntimeException('Writable source directory does not exist: ' . $target);
+				throw new RuntimeException('EvolutionWorkspace plugin directory does not exist: ' . $target);
 			}
 			if (!is_writable($target)) {
-				throw new RuntimeException('Writable source directory is not writable by the PHP process: ' . $target);
+				throw new RuntimeException('EvolutionWorkspace plugin is not writable by the PHP process: ' . $target);
 			}
 			return [
-				'message' => $this->configuration->isFrameworkWriteEnabled()
-					? 'Framework and plugin source writes are enabled.'
-					: 'Writes are restricted to plugin/.',
-				'details' => ['path' => $target, 'framework_write' => $this->configuration->isFrameworkWriteEnabled()]
+				'message' => 'Writes are restricted to ' . $this->configuration->getWorkspacePluginPath() . '/.',
+				'details' => ['path' => $target]
 			];
 		}, $analysisReady, $applyReady, false, true);
-
 		$this->runCheck($checks, 'runtime_dirs', 'Runtime directories', function(): array {
 			$errors = [];
 			foreach ([
@@ -98,35 +93,33 @@ final class EvolutionHealthService {
 			return ['message' => 'Local and temporary runtime directories are writable.'];
 		}, $analysisReady, $applyReady, false, true);
 
-		$this->runCheck($checks, 'git', 'Git repository', function(): array {
+		$this->runCheck($checks, 'git', 'EvolutionWorkspace Git', function(): array {
 			$status = $this->workspace->getGitStatus();
 			if (($status['available'] ?? false) !== true) {
-				throw new RuntimeException('Git repository is not available for the configured workspace: ' . (string)($status['error'] ?? 'unknown error'));
+				throw new RuntimeException('plugin/EvolutionWorkspace must be an independent Git repository before Apply: ' . (string)($status['error'] ?? 'unknown error'));
 			}
-			$root = $this->workspace->getGitRoot();
-			$workspace = realpath($this->configuration->getWorkspace());
-			if (!is_string($workspace) || $root === '' || rtrim($root, DIRECTORY_SEPARATOR) !== rtrim($workspace, DIRECTORY_SEPARATOR)) {
-				throw new RuntimeException('The configured Evolution workspace must be the Git repository root. Git root: ' . ($root !== '' ? $root : 'unknown'));
+			$root = trim((string)($status['root'] ?? ''));
+			$gitDirectory = $root !== '' ? $root . DIRECTORY_SEPARATOR . '.git' : '';
+			if ($gitDirectory !== '' && is_dir($gitDirectory) && !is_writable($gitDirectory)) {
+				throw new RuntimeException('EvolutionWorkspace Git metadata is not writable by the PHP process: ' . $gitDirectory);
 			}
-			$unmanaged = is_array($status['unmanaged_plugins'] ?? null) ? $status['unmanaged_plugins'] : [];
-			if ($unmanaged !== []) {
-				throw new RuntimeException('Plugin directories are not version controlled and cannot be changed safely: ' . implode(', ', $unmanaged) . '. Initialize/restore their plugin Git repositories and commit the accepted state first.');
+			$head = trim((string)($status['head'] ?? ''));
+			if ($head === '') {
+				throw new RuntimeException('EvolutionWorkspace Git repository has no initial commit. Commit the accepted workspace baseline before Apply.');
 			}
-			$repositories = is_array($status['repositories'] ?? null) ? $status['repositories'] : [];
 			return [
 				'message' => ($status['clean'] ?? false) === true
-					? 'Framework and plugin Git repositories are clean.'
-					: 'At least one framework/plugin Git repository contains uncommitted changes.',
+					? 'EvolutionWorkspace Git repository is clean.'
+					: 'EvolutionWorkspace Git repository contains uncommitted changes.',
 				'status' => ($status['clean'] ?? false) === true ? 'ok' : 'warning',
 				'details' => [
-					'root' => $root,
+					'root' => (string)($status['root'] ?? ''),
 					'clean' => (bool)($status['clean'] ?? false),
-					'head' => $this->workspace->getGitHead(),
-					'repositories' => array_keys($repositories)
+					'head' => $head,
+					'branch' => (string)($status['branch'] ?? '')
 				]
 			];
 		}, $analysisReady, $applyReady, false, $this->configuration->isGitRequired());
-
 		if ($this->configuration->isGitRequired()) {
 			$gitStatus = $checks['git']['details']['clean'] ?? null;
 			if ($gitStatus === false) {
@@ -228,10 +221,6 @@ final class EvolutionHealthService {
 					throw new RuntimeException('Evolution workspace preset has wrong resource type. Expected evolutionworkspaceagenttool.');
 				}
 				$classMap = $this->requireService(IClassMap::class, IClassMap::class, 'IClassMap is not available.');
-				$toolClass = $classMap->getClassByInterfaceName(IAgentResource::class, 'evolutionworkspaceagenttool');
-				if (!is_string($toolClass) || $toolClass === '') {
-					throw new RuntimeException('Evolution workspace agent tool was not discovered by IClassMap. Regenerate the class map and verify plugin/Evolution/src.');
-				}
 				$tool = $classMap->getInstanceByInterfaceName(IAgentResource::class, 'evolutionworkspaceagenttool');
 				if (!$tool instanceof IAgentTool) {
 					throw new RuntimeException('Evolution workspace resource does not implement IAgentTool.');
@@ -363,7 +352,7 @@ final class EvolutionHealthService {
 			}
 			$database->listQuery('SHOW TABLES');
 			return ['message' => 'Database connection and schema read access are available.'];
-		}, $analysisReady, $applyReady, true, true);
+		}, $analysisReady, $applyReady, false, false);
 
 		$this->runCheck($checks, 'state_store', 'State store', function(): array {
 			$state = $this->requireService(IStateStore::class, IStateStore::class, 'Wire IStateStore in the Website project plugin.');

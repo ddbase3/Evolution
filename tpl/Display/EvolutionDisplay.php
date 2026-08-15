@@ -83,7 +83,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		<div class="ev-header">
 			<div>
 				<h1>BASE3 Evolution</h1>
-				<div class="ev-subtitle">Analyze the current BASE3 application, produce an explicit change plan, then apply the approved plan through the MissionBay agent and controlled workspace tools.</div>
+				<div class="ev-subtitle">Analyze the BASE3 application as reference and evolve only plugin/EvolutionWorkspace through the MissionBay agent and controlled tools.</div>
 			</div>
 			<div class="ev-ready">
 				<span class="ev-pill <?php echo $analysisReady ? 'ok' : 'error'; ?>" data-role="analysis-ready">Analysis <?php echo $analysisReady ? 'ready' : 'blocked'; ?></span>
@@ -121,7 +121,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			<div class="ev-panel-head">
 				<div>
 					<h2>Requested change</h2>
-					<div class="ev-status-text">Analysis is read-only. Source mutation is technically disabled until Apply.</div>
+					<div class="ev-status-text">Analysis is read-only. Apply may mutate only plugin/EvolutionWorkspace.</div>
 				</div>
 			</div>
 			<div class="ev-panel-body">
@@ -241,7 +241,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			el('diff').textContent = result.diff || (result.changed_paths || []).join('\n');
 			el('result-panel').classList.add('visible');
 			message('result-message', result.message || 'Evolution change applied.', 'ok');
-			message('apply-message', 'Apply completed. Review and commit the resulting Git changes before starting another Apply.', 'ok');
+			message('apply-message', 'Apply completed. Review and commit the EvolutionWorkspace Git changes before starting another Apply.', 'ok');
 			return true;
 		}
 		function renderHealth(data) {

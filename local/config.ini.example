@@ -5,7 +5,8 @@
 data = "/path/to/base3/local"
 
 [evolution]
+; BASE3 application root. Evolution may read this tree, but source writes are
+; hard-restricted to plugin/EvolutionWorkspace.
 workspace = "/path/to/base3"
 git_required = true
-framework_write = false
 agent = "evolution"

@@ -49,7 +49,8 @@ final class EvolutionAgentService {
 			$this->buildAnalyzeInstruction($prompt),
 			[
 				'evolution_mode' => 'analyze',
-				'evolution_workspace' => $this->configuration->getWorkspace()
+				'evolution_workspace' => $this->configuration->getWorkspace(),
+				'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
 			]
 		);
 		$this->assertSuccessfulAgentResult($result, 'analysis');
@@ -222,6 +223,7 @@ final class EvolutionAgentService {
 			[
 				'evolution_mode' => 'analyze',
 				'evolution_workspace' => $this->configuration->getWorkspace(),
+				'evolution_write_root' => $this->configuration->getWorkspacePluginPath(),
 				'evolution_diagnostic' => true
 			]
 		);
@@ -286,23 +288,23 @@ final class EvolutionAgentService {
 
 	/** @param array<string,mixed> $change */
 	private function buildApplyInstruction(array $change): string {
-		return "Implement the approved Evolution change now.\n\n"
+		return "Implement the approved EvolutionWorkspace change now.\n\n"
 			. "Original user request:\n" . trim((string)($change['prompt'] ?? '')) . "\n\n"
 			. "Approved plan:\n" . trim((string)($change['plan'] ?? '')) . "\n\n"
-			. "Use the Evolution workspace tools to implement exactly this plan. Do not merely describe code. "
-			. "Respect the current BASE3 architecture and local coding style. Do not modify existing migrations. "
-			. "Do not change framework source when framework_write is disabled. Run available validation tools before your final response.";
+			. "Mutation is restricted to plugin/EvolutionWorkspace. Implement the approved plan there; do not merely describe code. "
+			. "Read other BASE3 source only when needed as a contract or implementation reference. Keep plugin init() limited to composition, preserve local coding conventions, and do not modify existing migrations. "
+			. "Run the available validation tools before the final response.";
 	}
 
 	private function buildAnalyzeInstruction(string $prompt): string {
-		return "Analyze this requested BASE3 application change without modifying files:\n\n"
+		return "Analyze this requested change for plugin/EvolutionWorkspace without modifying files:\n\n"
 			. $prompt
-			. "\n\nInspect the actual source, BASE3 structure, relevant settings and database schema with the available read-only tools. "
-			. "Return a concrete implementation plan: affected plugin/domain, files to create/change/delete, service or ClassMap impact, database migration impact, data-safety concerns and validation steps. "
-			. "If the request cannot be implemented safely with the available information, state the exact blocking reason instead of inventing an architecture.";
+			. "\n\nStart with plugin/EvolutionWorkspace. Search before listing broad trees and read only the files needed to understand the requested change. "
+			. "Inspect BASE3 framework, MissionBay, other plugins, settings or database schema only when the requested change actually depends on them. Stop exploring once the relevant contract and local implementation pattern are clear. "
+			. "Return a concise concrete implementation plan with files to create/change/delete, composition or ClassMap impact, migration impact only when relevant, and validation steps. "
+			. "All planned source mutations must stay inside plugin/EvolutionWorkspace. If the request cannot be implemented safely with that boundary, state the exact blocker.";
 	}
 
-	/** @return array<string,mixed> */
 	private function storeSuspendedApply(
 		IStateStore $state,
 		array $change,
@@ -395,12 +397,13 @@ final class EvolutionAgentService {
 		AgentExecutionResult $result,
 		array $baseGitSnapshot
 	): array {
-		$changedPaths = $this->configuration->isGitRequired() ? $this->workspace->getChangedPaths() : [];
+		$baseHead = trim((string)($baseGitSnapshot['head'] ?? ''));
+		$changedPaths = $this->configuration->isGitRequired() ? $this->workspace->getChangedPaths($baseHead) : [];
 		if ($this->configuration->isGitRequired() && $changedPaths === []) {
-			throw new RuntimeException('Apply completed without source changes. The approved plan was not implemented.');
+			throw new RuntimeException('Apply completed without EvolutionWorkspace source changes. The approved plan was not implemented.');
 		}
 
-		$validation = $this->validateAppliedChange();
+		$validation = $this->validateAppliedChange($baseHead);
 		if (($validation['ok'] ?? false) !== true) {
 			$rollback = $this->rollbackFailedChange($baseGitSnapshot);
 			$failed = array_merge($change, [
@@ -416,14 +419,14 @@ final class EvolutionAgentService {
 			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $failed, self::CHANGE_TTL_SECONDS);
 			return [
 				'ok' => false,
-				'message' => 'Generated change failed validation and was reverted to the accepted Git revision.',
+				'message' => 'Generated EvolutionWorkspace change failed validation and was reverted to the accepted Git revision.',
 				'validation' => $validation,
 				'rollback' => $rollback,
 				'warnings' => $result->getWarnings()
 			];
 		}
 
-		$diff = $this->configuration->isGitRequired() ? $this->workspace->getGitDiff() : '';
+		$diff = $this->configuration->isGitRequired() ? $this->workspace->getGitDiff($baseHead) : '';
 		$done = array_merge($change, [
 			'status' => 'applied',
 			'apply_finished_at' => time(),
@@ -439,7 +442,7 @@ final class EvolutionAgentService {
 		return [
 			'ok' => true,
 			'status' => 'applied',
-			'message' => 'Approved Evolution change was applied and validated.',
+			'message' => 'Approved EvolutionWorkspace change was applied and validated.',
 			'change_id' => $changeId,
 			'changed_paths' => $changedPaths,
 			'diff' => $diff,
@@ -458,7 +461,7 @@ final class EvolutionAgentService {
 		Throwable $error
 	): void {
 		$rollback = null;
-		if ($this->configuration->isGitRequired() && $baseGitSnapshot !== [] && !$this->workspace->isGitClean()) {
+		if ($this->configuration->isGitRequired() && $baseGitSnapshot !== []) {
 			$rollback = $this->rollbackFailedChange($baseGitSnapshot);
 		}
 		$state->set(self::CHANGE_KEY_PREFIX . $changeId, array_merge($change, [
@@ -476,7 +479,8 @@ final class EvolutionAgentService {
 		return [
 			'evolution_mode' => 'apply',
 			'evolution_change_id' => $changeId,
-			'evolution_workspace' => $this->configuration->getWorkspace()
+			'evolution_workspace' => $this->configuration->getWorkspace(),
+			'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
 		];
 	}
 
@@ -514,8 +518,8 @@ final class EvolutionAgentService {
 	}
 
 	/** @return array<string,mixed> */
-	private function validateAppliedChange(): array {
-		$lint = $this->workspace->validateChangedPhp();
+	private function validateAppliedChange(?string $baseHead = null): array {
+		$lint = $this->workspace->validateChangedPhp($baseHead);
 		if (($lint['ok'] ?? false) !== true) {
 			return ['ok' => false, 'step' => 'php_lint', 'php_lint' => $lint];
 		}

@@ -27,40 +27,40 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 	}
 
 	public function getDescription(): string {
-		return 'Inspects and, only during an approved Evolution Apply run, modifies the configured BASE3 workspace.';
+		return 'Reads the current BASE3 application and, only during approved Apply runs, mutates plugin/EvolutionWorkspace.';
 	}
 
 	public function getToolDefinitions(): array {
 		return [
-			$this->readDefinition('evolution_workspace_info', 'Evolution Workspace Info', 'Returns the configured workspace, write scope, Git status and discovered plugins.', []),
-			$this->readDefinition('evolution_list_files', 'List Workspace Files', 'Lists files and directories below a workspace-relative path.', [
-				'path' => ['type' => 'string', 'description' => 'Workspace-relative path. Empty means workspace root.'],
+			$this->readDefinition('evolution_workspace_info', 'Evolution Workspace Info', 'Returns the BASE3 application root, the dedicated writable EvolutionWorkspace plugin, Git status and discovered plugins.', []),
+			$this->readDefinition('evolution_list_files', 'List Application Files', 'Lists files and directories below an application-relative path.', [
+				'path' => ['type' => 'string', 'description' => 'Application-relative path. Empty means application root.'],
 				'max_depth' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 12],
 				'max_files' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 2000]
 			]),
-			$this->readDefinition('evolution_read_file', 'Read Workspace File', 'Reads one text file from the Evolution workspace.', [
-				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Workspace-relative file path.']
+			$this->readDefinition('evolution_read_file', 'Read Application File', 'Reads one text file from the BASE3 application.', [
+				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative file path.']
 			], ['path']),
-			$this->readDefinition('evolution_search_source', 'Search Workspace Source', 'Searches text source files for a literal case-insensitive string.', [
+			$this->readDefinition('evolution_search_source', 'Search Application Source', 'Searches application text files for a literal case-insensitive string. Search narrowly before listing large trees.', [
 				'query' => ['type' => 'string', 'minLength' => 1],
-				'path' => ['type' => 'string', 'description' => 'Optional workspace-relative search root.'],
+				'path' => ['type' => 'string', 'description' => 'Optional application-relative search root.'],
 				'max_results' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 250]
 			], ['query']),
-			$this->readDefinition('evolution_database_schema', 'Inspect Database Schema', 'Lists database tables or describes columns and indexes for one table. It never executes arbitrary SQL.', [
+			$this->readDefinition('evolution_database_schema', 'Inspect Database Schema', 'Lists database tables or describes columns and indexes for one table. Use only when the requested change depends on persisted data. It never executes arbitrary SQL.', [
 				'table' => ['type' => 'string', 'description' => 'Optional exact table name. Empty lists all tables.']
 			]),
-			$this->readDefinition('evolution_git_diff', 'Evolution Git Diff', 'Returns the current Git diff and untracked file list for the Evolution workspace.', []),
-			$this->readDefinition('evolution_php_lint', 'Validate Changed PHP', 'Runs PHP syntax validation for changed PHP files.', []),
-			$this->mutationDefinition('evolution_write_file', 'Write Workspace File', 'Creates or replaces one text file inside the configured Evolution write scope.', [
-				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Workspace-relative target path.'],
+			$this->readDefinition('evolution_git_diff', 'EvolutionWorkspace Git Diff', 'Returns the current Git diff and untracked file list for plugin/EvolutionWorkspace only.', []),
+			$this->readDefinition('evolution_php_lint', 'Validate Changed PHP', 'Runs PHP syntax validation for changed PHP files inside plugin/EvolutionWorkspace.', []),
+			$this->mutationDefinition('evolution_write_file', 'Write EvolutionWorkspace File', 'Creates or replaces one text file inside plugin/EvolutionWorkspace. Paths outside that plugin are rejected.', [
+				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative target path below plugin/EvolutionWorkspace/.'],
 				'content' => ['type' => 'string', 'description' => 'Complete target file content.']
 			], ['path', 'content']),
-			$this->mutationDefinition('evolution_delete_path', 'Delete Workspace Path', 'Deletes one file or directory inside the configured Evolution write scope.', [
-				'path' => ['type' => 'string', 'minLength' => 1],
+			$this->mutationDefinition('evolution_delete_path', 'Delete EvolutionWorkspace Path', 'Deletes one file or directory inside plugin/EvolutionWorkspace. Paths outside that plugin are rejected.', [
+				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative path below plugin/EvolutionWorkspace/.'],
 				'recursive' => ['type' => 'boolean', 'description' => 'Required true for non-empty directories.']
 			], ['path']),
-			$this->mutationDefinition('evolution_refresh_classmap', 'Regenerate BASE3 ClassMap', 'Regenerates the existing BASE3 ClassMap and constructor cache.', [], []),
-			$this->mutationDefinition('evolution_run_tests', 'Run Project Tests', 'Runs the project PHPUnit suite when PHPUnit is available.', [], [])
+			$this->mutationDefinition('evolution_refresh_classmap', 'Regenerate BASE3 ClassMap', 'Regenerates the existing BASE3 ClassMap after approved EvolutionWorkspace source changes.', [], []),
+			$this->mutationDefinition('evolution_run_tests', 'Run EvolutionWorkspace Tests', 'Runs the EvolutionWorkspace PHPUnit test directory when it exists and PHPUnit is available.', [], [])
 		];
 	}
 

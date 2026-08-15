@@ -6,6 +6,9 @@ use Base3\Configuration\Api\IConfiguration;
 
 final class EvolutionConfiguration {
 
+	public const WORKSPACE_PLUGIN = 'EvolutionWorkspace';
+	public const WORKSPACE_PLUGIN_PATH = 'plugin/EvolutionWorkspace';
+
 	public function __construct(
 		private readonly IConfiguration $configuration
 	) {}
@@ -14,12 +17,16 @@ final class EvolutionConfiguration {
 		return trim($this->configuration->getString('evolution', 'workspace', ''));
 	}
 
-	public function isGitRequired(): bool {
-		return $this->configuration->getBool('evolution', 'git_required', true);
+	public function getWorkspacePlugin(): string {
+		return self::WORKSPACE_PLUGIN;
 	}
 
-	public function isFrameworkWriteEnabled(): bool {
-		return $this->configuration->getBool('evolution', 'framework_write', false);
+	public function getWorkspacePluginPath(): string {
+		return self::WORKSPACE_PLUGIN_PATH;
+	}
+
+	public function isGitRequired(): bool {
+		return $this->configuration->getBool('evolution', 'git_required', true);
 	}
 
 	public function getAgentId(): string {
