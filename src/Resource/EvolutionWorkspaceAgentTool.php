@@ -9,7 +9,6 @@ use Evolution\Service\EvolutionWorkspaceService;
 use InvalidArgumentException;
 use MissionBay\Api\IAgentTool;
 use MissionBay\Resource\AbstractAgentResource;
-use RuntimeException;
 use Throwable;
 
 final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements IAgentTool, IOutputSchemaProvider {
@@ -27,7 +26,7 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 	}
 
 	public function getDescription(): string {
-		return 'Reads the current BASE3 application and, only during approved Apply runs, mutates plugin/EvolutionWorkspace.';
+		return 'Reads the current BASE3 application and submits one complete approval-bound change plan for plugin/EvolutionWorkspace.';
 	}
 
 	public function getToolDefinitions(): array {
@@ -38,8 +37,10 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'max_depth' => ['type' => 'integer', 'minimum' => 0, 'maximum' => 12],
 				'max_files' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 2000]
 			]),
-			$this->readDefinition('evolution_read_file', 'Read Application File', 'Reads one text file from the BASE3 application.', [
-				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative file path.']
+			$this->readDefinition('evolution_read_file', 'Read Application File', 'Reads a bounded line range from one text file. Use search-result line numbers and request additional ranges only when needed.', [
+				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative file path.'],
+				'start_line' => ['type' => 'integer', 'minimum' => 1, 'description' => 'First line to return. Default: 1.'],
+				'max_lines' => ['type' => 'integer', 'minimum' => 1, 'maximum' => 1200, 'description' => 'Maximum lines to return. Default: 160.']
 			], ['path']),
 			$this->readDefinition('evolution_search_source', 'Search Application Source', 'Searches application text files for a literal case-insensitive string. Search narrowly before listing large trees.', [
 				'query' => ['type' => 'string', 'minLength' => 1],
@@ -50,17 +51,52 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'table' => ['type' => 'string', 'description' => 'Optional exact table name. Empty lists all tables.']
 			]),
 			$this->readDefinition('evolution_git_diff', 'EvolutionWorkspace Git Diff', 'Returns the current Git diff and untracked file list for plugin/EvolutionWorkspace only.', []),
-			$this->readDefinition('evolution_php_lint', 'Validate Changed PHP', 'Runs PHP syntax validation for changed PHP files inside plugin/EvolutionWorkspace.', []),
-			$this->mutationDefinition('evolution_write_file', 'Write EvolutionWorkspace File', 'Creates or replaces one text file inside plugin/EvolutionWorkspace. Paths outside that plugin are rejected.', [
-				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative target path below plugin/EvolutionWorkspace/.'],
-				'content' => ['type' => 'string', 'description' => 'Complete target file content.']
-			], ['path', 'content']),
-			$this->mutationDefinition('evolution_delete_path', 'Delete EvolutionWorkspace Path', 'Deletes one file or directory inside plugin/EvolutionWorkspace. Paths outside that plugin are rejected.', [
-				'path' => ['type' => 'string', 'minLength' => 1, 'description' => 'Application-relative path below plugin/EvolutionWorkspace/.'],
-				'recursive' => ['type' => 'boolean', 'description' => 'Required true for non-empty directories.']
-			], ['path']),
-			$this->mutationDefinition('evolution_refresh_classmap', 'Regenerate BASE3 ClassMap', 'Regenerates the existing BASE3 ClassMap after approved EvolutionWorkspace source changes.', [], []),
-			$this->mutationDefinition('evolution_run_tests', 'Run EvolutionWorkspace Tests', 'Runs the EvolutionWorkspace PHPUnit test directory when it exists and PHPUnit is available.', [], [])
+			$this->mutationDefinition(
+				'evolution_apply_plan',
+				'Apply EvolutionWorkspace Plan',
+				'Call this exactly once after analysis is complete. The arguments are the final concrete change plan. MissionBay pauses before execution so the host can show the plan to the user. After explicit approval, the exact stored operations are executed without asking the model to plan again.',
+				[
+					'summary' => [
+						'type' => 'string',
+						'minLength' => 1,
+						'description' => 'Concise description of the complete requested change.'
+					],
+					'operations' => [
+						'type' => 'array',
+						'minItems' => 1,
+						'maxItems' => 50,
+						'description' => 'Complete ordered source mutation plan. Each target path may occur only once.',
+						'items' => [
+							'type' => 'object',
+							'properties' => [
+								'action' => [
+									'type' => 'string',
+									'enum' => ['write', 'delete']
+								],
+								'path' => [
+									'type' => 'string',
+									'minLength' => 1,
+									'description' => 'Application-relative path below plugin/EvolutionWorkspace/.'
+								],
+								'content' => [
+									'type' => 'string',
+									'description' => 'Complete target file content. Required for write operations.'
+								],
+								'recursive' => [
+									'type' => 'boolean',
+									'description' => 'For delete operations, set true only when a non-empty directory must be removed.'
+								],
+								'reason' => [
+									'type' => 'string',
+									'description' => 'Short reason for this exact file operation.'
+								]
+							],
+							'required' => ['action', 'path']
+						]
+					]
+				],
+				['summary', 'operations']
+			)
 		];
 	}
 
@@ -70,33 +106,26 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'evolution_workspace_info' => $this->workspace->getWorkspaceInfo(),
 				'evolution_list_files' => $this->workspace->listFiles(
 					(string)($arguments['path'] ?? ''),
-					(int)($arguments['max_depth'] ?? 3),
-					(int)($arguments['max_files'] ?? 250)
+					(int)($arguments['max_depth'] ?? 2),
+					(int)($arguments['max_files'] ?? 120)
 				),
-				'evolution_read_file' => [
-					'path' => (string)($arguments['path'] ?? ''),
-					'content' => $this->workspace->readFile((string)($arguments['path'] ?? ''))
-				],
+				'evolution_read_file' => $this->workspace->readFileRange(
+					(string)($arguments['path'] ?? ''),
+					(int)($arguments['start_line'] ?? 1),
+					(int)($arguments['max_lines'] ?? 160)
+				),
 				'evolution_search_source' => $this->workspace->searchSource(
 					(string)($arguments['query'] ?? ''),
 					(string)($arguments['path'] ?? ''),
-					(int)($arguments['max_results'] ?? 50)
+					(int)($arguments['max_results'] ?? 20)
 				),
 				'evolution_database_schema' => $this->databaseInspector->inspect(
 					isset($arguments['table']) ? (string)$arguments['table'] : null
 				),
 				'evolution_git_diff' => ['diff' => $this->workspace->getGitDiff()],
-				'evolution_php_lint' => $this->workspace->validateChangedPhp(),
-				'evolution_write_file' => $this->applyOnly($context, fn() => $this->workspace->writeFile(
-					(string)($arguments['path'] ?? ''),
-					(string)($arguments['content'] ?? '')
-				)),
-				'evolution_delete_path' => $this->applyOnly($context, fn() => $this->workspace->deletePath(
-					(string)($arguments['path'] ?? ''),
-					(bool)($arguments['recursive'] ?? false)
-				)),
-				'evolution_refresh_classmap' => $this->applyOnly($context, fn() => $this->workspace->refreshClassMap()),
-				'evolution_run_tests' => $this->applyOnly($context, fn() => $this->workspace->runTests()),
+				'evolution_apply_plan' => $this->workspace->applyPlan(
+					is_array($arguments['operations'] ?? null) ? $arguments['operations'] : []
+				),
 				default => throw new InvalidArgumentException('Unsupported Evolution tool: ' . $name)
 			};
 		} catch (Throwable $e) {
@@ -117,11 +146,7 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 			'evolution_search_source' => ['type' => 'array'],
 			'evolution_database_schema' => $schema,
 			'evolution_git_diff' => $schema,
-			'evolution_php_lint' => $schema,
-			'evolution_write_file' => $schema,
-			'evolution_delete_path' => $schema,
-			'evolution_refresh_classmap' => $schema,
-			'evolution_run_tests' => $schema
+			'evolution_apply_plan' => $schema
 		];
 	}
 
@@ -167,17 +192,10 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'description' => $description,
 				'parameters' => [
 					'type' => 'object',
-					'properties' => $properties !== [] ? $properties : new \stdClass(),
+					'properties' => $properties,
 					'required' => $required
 				]
 			]
 		];
-	}
-
-	private function applyOnly(IAgentContext $context, callable $operation): mixed {
-		if ($context->getVar('evolution_mode') !== 'apply') {
-			throw new RuntimeException('Evolution source mutation is disabled during analysis. Use the explicit Apply action first.');
-		}
-		return $operation();
 	}
 }

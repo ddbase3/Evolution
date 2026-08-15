@@ -14,7 +14,7 @@ Open the UI through the normal BASE3 output route:
 
 `?name=evolutiondisplay&out=html`
 
-Analysis is read-only. Apply uses MissionBay approval before concrete mutation tools execute.
+Analysis and Apply use one persistent MissionBay run. The agent reads the application and submits exactly one complete `evolution_apply_plan` tool call. Because that tool requires MissionBay approval, execution suspends before any source mutation. The UI renders the stored plan. `Apply approved plan` resumes that same MissionBay run and authorizes exactly the stored operation set; no second model decision is used to translate the plan into writes.
 
 ## Configuration
 
@@ -36,7 +36,7 @@ MissionBay settings stay in `ISettingsStore`, normally:
 
 `<directories.data>/cnf/settings.json`
 
-The bundled settings examples provide the `evolution` agent, `evolution-workspace` tool preset and a dedicated governed orchestrator profile with 32 tool loops and native model decision.
+The bundled settings examples provide the `evolution` agent, `evolution-workspace` tool preset and a dedicated governed orchestrator profile with 32 tool loops, native model decision, MissionBay context compaction and deliberate planning. Deliberate planning adds no extra planning model call; it instructs the existing orchestrator to use focused evidence calls and stop when the task is supported.
 
 ## EvolutionWorkspace repository
 
@@ -57,19 +57,21 @@ When `git_required=true`, Apply requires this repository to have an initial comm
 
 ## Safety boundary
 
-Evolution may read the complete configured application root so it can inspect BASE3 contracts and existing implementation patterns. Mutation tools enforce this single source boundary:
+Evolution may read the complete configured application root so it can inspect BASE3 contracts and existing implementation patterns. The single approval-bound apply-plan tool enforces this source boundary:
 
 `plugin/EvolutionWorkspace/**`
 
 Direct `.git` file access, arbitrary shell execution and arbitrary schema-changing SQL are not exposed.
 
-PHP writes are syntax-checked before the temporary file replaces the target file. After Apply, Evolution validates changed PHP, regenerates the BASE3 ClassMap and runs the `EvolutionWorkspace/test` PHPUnit directory when present. Failed validation restores the EvolutionWorkspace Git repository to the accepted revision.
+PHP writes are syntax-checked before the temporary file replaces the target file. After Apply, Evolution validates changed PHP, forces `IClassMap::generate(true)`, verifies both `DIR_TMP/classmap.php` and `DIR_TMP/ctorcache.php`, and then runs the `EvolutionWorkspace/test` PHPUnit directory when present. Failed validation restores the EvolutionWorkspace Git repository to the accepted revision and regenerates the discovery artifacts again.
 
 ## Analysis behavior
 
-The agent is instructed to start with `plugin/EvolutionWorkspace`, search before broad directory listing, and inspect framework/plugins/settings/database only when the requested change depends on them. This keeps small changes small and avoids consuming repository-wide context for simple tasks.
+The agent is instructed to start with `plugin/EvolutionWorkspace`, search before broad directory listing, and inspect framework/plugins/settings/database only when the requested change depends on them. `evolution_read_file` returns bounded line ranges (160 lines by default, up to 1200) with line metadata and `has_more`, so a search hit can be inspected without injecting a complete large source file into every later model decision. Independent known reads should be batched in one tool-call turn.
 
-The source fingerprint still covers relevant application source so an approved plan is invalidated when its reference implementation changes between Analysis and Apply.
+MissionBay `context-compaction` remains the only AI summarization mechanism in this path. In the governed profile it runs between tool execution and tool observation and summarizes individual successful tool results above MissionBay's configured threshold before they become model messages. Evolution does not maintain a second summarized context. Focused source reads are still important because compaction itself uses the active model and therefore also consumes provider tokens.
+
+The source fingerprint still covers relevant application source so an approved plan is invalidated when its reference implementation changes between Analysis and Apply. Framework-dependent plans must inspect the exact current BASE3 contract before submitting `evolution_apply_plan`; discoverable ClassMap components are not container-registered merely for discovery. The plan contains the complete ordered mutation set and complete content for every write, so Apply is deterministic and does not ask the model to decide again whether or how to write the approved files.
 
 ## OpenAI baseline
 

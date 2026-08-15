@@ -105,7 +105,19 @@
                 "confidence_threshold": 0.7
             },
             "optional_stages": {
+                "capability-discovery": true,
+                "capability-selection": true,
+                "ai-capability-selection": false,
+                "context-compaction": true,
                 "semantic-verification": false
+            },
+            "deliberate_planning": true,
+            "capability_selection": {
+                "enabled": true,
+                "strategy": "hybrid",
+                "max_tools": 8,
+                "select_all_threshold": 8,
+                "sticky": true
             }
         }
     }

@@ -12,8 +12,12 @@ use Throwable;
 final class EvolutionWorkspaceService {
 
 	private const MAX_READ_BYTES = 500000;
+	private const DEFAULT_READ_LINES = 160;
+	private const MAX_READ_LINES = 1200;
 	private const MAX_WRITE_BYTES = 5000000;
 	private const MAX_PROCESS_OUTPUT_BYTES = 500000;
+	private const MAX_PLAN_OPERATIONS = 50;
+	private const MAX_PLAN_BYTES = 10000000;
 
 	public function __construct(
 		private readonly EvolutionConfiguration $configuration,
@@ -96,6 +100,35 @@ final class EvolutionWorkspaceService {
 		return $content;
 	}
 
+	/** @return array{path:string,start_line:int,end_line:int,total_lines:int,has_more:bool,content:string} */
+	public function readFileRange(
+		string $relativePath,
+		int $startLine = 1,
+		int $maxLines = self::DEFAULT_READ_LINES
+	): array {
+		$content = $this->readFile($relativePath);
+		$lines = preg_split('/\R/u', $content);
+		if (!is_array($lines)) {
+			$lines = [$content];
+		}
+
+		$totalLines = count($lines);
+		$startLine = max(1, $startLine);
+		$maxLines = max(1, min(self::MAX_READ_LINES, $maxLines));
+		$offset = min($totalLines, $startLine - 1);
+		$selected = array_slice($lines, $offset, $maxLines);
+		$endLine = $selected === [] ? $offset : $offset + count($selected);
+
+		return [
+			'path' => $this->normalizeRelativePath($relativePath),
+			'start_line' => $selected === [] ? $startLine : $offset + 1,
+			'end_line' => $endLine,
+			'total_lines' => $totalLines,
+			'has_more' => $endLine < $totalLines,
+			'content' => implode("\n", $selected)
+		];
+	}
+
 	/** @return array<int,array{file:string,line:int,text:string}> */
 	public function searchSource(string $query, string $relativePath = '', int $maxResults = 50): array {
 		$query = trim($query);
@@ -121,12 +154,17 @@ final class EvolutionWorkspaceService {
 				if (!$item->isFile() || $item->isLink()) {
 					continue;
 				}
-				$relative = $this->relativePath($item->getPathname());
-				if ($this->isIgnoredPath($relative) || $item->getSize() > self::MAX_READ_BYTES) {
+				$itemRelative = $this->relativePath($item->getPathname());
+				if ($this->isIgnoredPath($itemRelative) || $item->getSize() > self::MAX_READ_BYTES) {
 					continue;
 				}
 				$files[] = $item->getPathname();
 			}
+		}
+
+		$symbol = '';
+		if (preg_match('/([A-Za-z_][A-Za-z0-9_]*)\\s*$/', $query, $matches) === 1) {
+			$symbol = (string)($matches[1] ?? '');
 		}
 
 		$result = [];
@@ -135,23 +173,51 @@ final class EvolutionWorkspaceService {
 			if ($content === false || str_contains($content, "\0")) {
 				continue;
 			}
-			$lines = preg_split('/\R/u', $content) ?: [];
+			$fileRelative = $this->relativePath($file);
+			$lines = preg_split('/\\R/u', $content) ?: [];
 			foreach ($lines as $index => $line) {
 				if (stripos($line, $query) === false) {
 					continue;
 				}
 				$result[] = [
-					'file' => $this->relativePath($file),
+					'file' => $fileRelative,
 					'line' => $index + 1,
-					'text' => $this->limitText(trim($line), 500)
+					'text' => $this->limitText(trim($line), 500),
+					'_priority' => $this->getSearchPriority($fileRelative, $symbol)
 				];
-				if (count($result) >= $maxResults) {
-					return $result;
-				}
 			}
 		}
 
-		return $result;
+		usort($result, static function(array $left, array $right): int {
+			$priority = ((int)$left['_priority']) <=> ((int)$right['_priority']);
+			if ($priority !== 0) {
+				return $priority;
+			}
+			$file = ((string)$left['file']) <=> ((string)$right['file']);
+			return $file !== 0 ? $file : ((int)$left['line']) <=> ((int)$right['line']);
+		});
+
+		$result = array_slice($result, 0, $maxResults);
+		return array_map(static function(array $entry): array {
+			unset($entry['_priority']);
+			return $entry;
+		}, $result);
+	}
+
+	private function getSearchPriority(string $relativePath, string $symbol): int {
+		$priority = match(true) {
+			str_starts_with($relativePath, 'src/') => 0,
+			str_starts_with($relativePath, $this->configuration->getWorkspacePluginPath() . '/src/') => 10,
+			str_starts_with($relativePath, 'plugin/') => 20,
+			str_starts_with($relativePath, 'test/') => 80,
+			default => 40
+		};
+
+		if ($symbol !== '' && strcasecmp(pathinfo($relativePath, PATHINFO_FILENAME), $symbol) === 0) {
+			$priority -= 20;
+		}
+
+		return $priority;
 	}
 
 	/** @return array<string,mixed> */
@@ -173,7 +239,7 @@ final class EvolutionWorkspaceService {
 
 		try {
 			if (str_ends_with(strtolower($target), '.php')) {
-				$lint = $this->runProcess([PHP_BINARY, '-l', $temp], $this->requireWorkspace());
+				$lint = $this->runProcess([$this->getPhpCliBinary(), '-l', $temp], $this->requireWorkspace());
 				if ($lint['exit_code'] !== 0) {
 					throw new RuntimeException('Generated PHP is not syntactically valid: ' . trim($lint['stdout'] . "\n" . $lint['stderr']));
 				}
@@ -227,6 +293,128 @@ final class EvolutionWorkspaceService {
 		}
 
 		return ['ok' => true, 'path' => $relative, 'type' => 'directory'];
+	}
+
+
+	/** @param array<int,mixed> $operations @return array<int,array<string,mixed>> */
+	public function validatePlanOperations(array $operations): array {
+		return $this->normalizePlanOperations($operations);
+	}
+
+	/** @param array<int,mixed> $operations @return array<string,mixed> */
+	public function applyPlan(array $operations): array {
+		$normalized = $this->normalizePlanOperations($operations);
+		$results = [];
+
+		foreach ($normalized as $operation) {
+			if ($operation['action'] === 'write') {
+				$results[] = [
+					'action' => 'write',
+					'path' => $operation['path'],
+					'result' => $this->writeFile($operation['path'], $operation['content'])
+				];
+				continue;
+			}
+
+			$results[] = [
+				'action' => 'delete',
+				'path' => $operation['path'],
+				'result' => $this->deletePath($operation['path'], $operation['recursive'])
+			];
+		}
+
+		return [
+			'ok' => true,
+			'operation_count' => count($results),
+			'operations' => $results
+		];
+	}
+
+	/** @param array<int,mixed> $operations @return array<int,array<string,mixed>> */
+	private function normalizePlanOperations(array $operations): array {
+		if ($operations === []) {
+			throw new RuntimeException('Evolution change plan contains no source operations.');
+		}
+		if (count($operations) > self::MAX_PLAN_OPERATIONS) {
+			throw new RuntimeException('Evolution change plan exceeds the maximum of ' . self::MAX_PLAN_OPERATIONS . ' operations.');
+		}
+
+		$normalized = [];
+		$paths = [];
+		$totalBytes = 0;
+		foreach ($operations as $index => $operation) {
+			if (!is_array($operation)) {
+				throw new RuntimeException('Evolution change plan operation #' . ($index + 1) . ' is not an object.');
+			}
+
+			$action = strtolower(trim((string)($operation['action'] ?? '')));
+			if (!in_array($action, ['write', 'delete'], true)) {
+				throw new RuntimeException('Evolution change plan operation #' . ($index + 1) . ' has unsupported action: ' . ($action !== '' ? $action : '(empty)'));
+			}
+
+			$path = $this->normalizeRelativePath((string)($operation['path'] ?? ''));
+			if ($path === '') {
+				throw new RuntimeException('Evolution change plan operation #' . ($index + 1) . ' has an empty path.');
+			}
+			$this->assertWriteAllowed($path);
+			if (isset($paths[$path])) {
+				throw new RuntimeException('Evolution change plan targets the same path more than once: ' . $path);
+			}
+			$paths[$path] = true;
+
+			$reason = trim((string)($operation['reason'] ?? ''));
+			if ($action === 'write') {
+				if (!array_key_exists('content', $operation) || !is_string($operation['content'])) {
+					throw new RuntimeException('Evolution write operation requires complete string content: ' . $path);
+				}
+				$content = $operation['content'];
+				$bytes = strlen($content);
+				if ($bytes > self::MAX_WRITE_BYTES) {
+					throw new RuntimeException('Evolution write operation exceeds the per-file write limit: ' . $path);
+				}
+				$totalBytes += $bytes;
+				if ($totalBytes > self::MAX_PLAN_BYTES) {
+					throw new RuntimeException('Evolution change plan exceeds the total write limit of ' . self::MAX_PLAN_BYTES . ' bytes.');
+				}
+
+				$target = $this->resolveWritableTarget($path);
+				if (is_file($target)) {
+					$current = file_get_contents($target);
+					if (is_string($current) && hash_equals(hash('sha256', $current), hash('sha256', $content))) {
+						throw new RuntimeException('Evolution change plan contains a no-op write with unchanged content: ' . $path);
+					}
+				}
+
+				$normalized[] = [
+					'action' => 'write',
+					'path' => $path,
+					'content' => $content,
+					'reason' => $reason
+				];
+				continue;
+			}
+
+			$target = $this->resolveWritableExistingPath($path);
+			if ($this->relativePath($target) === $this->configuration->getWorkspacePluginPath()) {
+				throw new RuntimeException('Evolution change plan may not delete the EvolutionWorkspace repository root.');
+			}
+			$recursive = (bool)($operation['recursive'] ?? false);
+			if (is_dir($target) && !$recursive) {
+				$children = iterator_count(new FilesystemIterator($target, FilesystemIterator::SKIP_DOTS));
+				if ($children > 0) {
+					throw new RuntimeException('Evolution delete operation requires recursive=true for non-empty directory: ' . $path);
+				}
+			}
+
+			$normalized[] = [
+				'action' => 'delete',
+				'path' => $path,
+				'recursive' => $recursive,
+				'reason' => $reason
+			];
+		}
+
+		return $normalized;
 	}
 
 	/** @return array<string,mixed> */
@@ -456,7 +644,7 @@ final class EvolutionWorkspaceService {
 
 		foreach ($files as $file) {
 			$absolute = $this->resolveExistingPath($file, false);
-			$result = $this->runProcess([PHP_BINARY, '-l', $absolute], $this->requireWorkspace());
+			$result = $this->runProcess([$this->getPhpCliBinary(), '-l', $absolute], $this->requireWorkspace());
 			$passed = $result['exit_code'] === 0;
 			$ok = $ok && $passed;
 			$results[] = [
@@ -477,7 +665,27 @@ final class EvolutionWorkspaceService {
 	public function refreshClassMap(): array {
 		try {
 			$this->classMap->generate(true);
-			return ['ok' => true, 'message' => 'BASE3 class map regenerated successfully.'];
+
+			$artifacts = [];
+			foreach ([
+				'classmap' => DIR_TMP . 'classmap.php',
+				'ctorcache' => DIR_TMP . 'ctorcache.php'
+			] as $name => $file) {
+				$size = is_file($file) ? filesize($file) : false;
+				if (!is_int($size) || $size <= 0 || !is_readable($file)) {
+					throw new RuntimeException('BASE3 discovery artifact was not regenerated correctly: ' . $file);
+				}
+				$artifacts[$name] = [
+					'file' => $file,
+					'bytes' => $size
+				];
+			}
+
+			return [
+				'ok' => true,
+				'message' => 'BASE3 classmap.php and ctorcache.php regenerated successfully.',
+				'artifacts' => $artifacts
+			];
 		} catch (Throwable $e) {
 			return ['ok' => false, 'message' => $e->getMessage(), 'type' => $e::class];
 		}
@@ -497,7 +705,7 @@ final class EvolutionWorkspaceService {
 
 		$vendorPhpunit = $workspace . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'phpunit';
 		if (is_file($vendorPhpunit)) {
-			$command = [PHP_BINARY, $vendorPhpunit, '--colors=never', $testDirectory];
+			$command = [$this->getPhpCliBinary(), $vendorPhpunit, '--colors=never', $testDirectory];
 		} elseif (is_executable('/usr/local/bin/phpunit')) {
 			$command = ['/usr/local/bin/phpunit', '--colors=never', $testDirectory];
 		} elseif (is_executable('/usr/bin/phpunit')) {
@@ -542,6 +750,38 @@ final class EvolutionWorkspaceService {
 			'message' => 'EvolutionWorkspace restored to the accepted revision.',
 			'output' => trim($reset['stdout'] . "\n" . $clean['stdout'])
 		];
+	}
+
+	public function getPhpCliBinary(): string {
+		$version = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+		$candidates = [
+			PHP_BINDIR . DIRECTORY_SEPARATOR . 'php',
+			PHP_BINDIR . DIRECTORY_SEPARATOR . 'php' . $version,
+			'/usr/bin/php',
+			'/usr/bin/php' . $version,
+			'/usr/local/bin/php',
+			PHP_BINARY
+		];
+
+		foreach (array_values(array_unique($candidates)) as $candidate) {
+			if ($candidate === '' || !is_file($candidate) || !is_executable($candidate)) {
+				continue;
+			}
+
+			$probe = $this->runProcess(
+				[$candidate, '-r', 'exit(PHP_SAPI === \'cli\' ? 0 : 1);'],
+				$this->requireWorkspace()
+			);
+			if ($probe['exit_code'] === 0) {
+				$real = realpath($candidate);
+				return is_string($real) ? $real : $candidate;
+			}
+		}
+
+		throw new RuntimeException(
+			'PHP CLI executable not found. Runtime PHP_BINARY is ' . PHP_BINARY . ' (' . PHP_SAPI . '). '
+			. 'Evolution requires a CLI PHP binary for linting and local test execution.'
+		);
 	}
 
 	public function hasPhpUnit(): bool {

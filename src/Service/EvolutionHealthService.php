@@ -93,6 +93,25 @@ final class EvolutionHealthService {
 			return ['message' => 'Local and temporary runtime directories are writable.'];
 		}, $analysisReady, $applyReady, false, true);
 
+		$this->runCheck($checks, 'discovery_artifacts', 'Discovery artifacts', function(): array {
+			$details = [];
+			foreach ([
+				'classmap' => DIR_TMP . 'classmap.php',
+				'ctorcache' => DIR_TMP . 'ctorcache.php'
+			] as $name => $file) {
+				$size = is_file($file) ? filesize($file) : false;
+				$details[$name] = [
+					'file' => $file,
+					'bytes' => is_int($size) ? $size : 0
+				];
+			}
+
+			return [
+				'message' => 'BASE3 classmap.php and ctorcache.php are regenerated together after every applied PHP change.',
+				'details' => $details
+			];
+		}, $analysisReady, $applyReady, false, true);
+
 		$this->runCheck($checks, 'git', 'EvolutionWorkspace Git', function(): array {
 			$status = $this->workspace->getGitStatus();
 			if (($status['available'] ?? false) !== true) {
@@ -225,6 +244,7 @@ final class EvolutionHealthService {
 				if (!$tool instanceof IAgentTool) {
 					throw new RuntimeException('Evolution workspace resource does not implement IAgentTool.');
 				}
+				$mutationTools = [];
 				foreach ($tool->getToolDefinitions() as $definition) {
 					if (!is_array($definition)) {
 						throw new RuntimeException('Evolution workspace tool returned an invalid function definition.');
@@ -238,9 +258,15 @@ final class EvolutionHealthService {
 					if (($parameters['properties'] ?? null) === []) {
 						throw new RuntimeException('Evolution tool has an OpenAI-incompatible empty properties array. Parameterless tools must serialize properties as an object: ' . $name);
 					}
-					if (($definition['mutation'] ?? false) === true && ($definition['requiresApproval'] ?? false) !== true) {
-						throw new RuntimeException('Evolution mutation tool does not require MissionBay approval and will not be exposed: ' . $name);
+					if (($definition['mutation'] ?? false) === true) {
+						if (($definition['requiresApproval'] ?? false) !== true) {
+							throw new RuntimeException('Evolution mutation tool does not require MissionBay approval and will not be exposed: ' . $name);
+						}
+						$mutationTools[] = $name;
 					}
+				}
+				if ($mutationTools !== ['evolution_apply_plan']) {
+					throw new RuntimeException('Evolution must expose exactly one approval-bound mutation tool: evolution_apply_plan. Found: ' . implode(', ', $mutationTools));
 				}
 
 				$orchestratorProfileId = strtolower(trim((string)($agent['orchestrator_profile'] ?? AgentOrchestratorProfileRepository::DEFAULT_PROFILE_ID)));
@@ -252,18 +278,25 @@ final class EvolutionHealthService {
 				$orchestratorProfile = $profileRepository->getProfile($orchestratorProfileId);
 				$maxToolLoops = $orchestratorProfile->getMaxToolLoops();
 				$modelDecisionStrategy = $orchestratorProfile->getModelDecision()->getStrategy();
+				$stageIds = $orchestratorProfile->getStageIds();
+				$contextCompaction = in_array('context-compaction', $stageIds, true);
+				$deliberatePlanning = $orchestratorProfile->isDeliberatePlanningEnabled();
 				$lowLoopLimit = $maxToolLoops < 16;
 				$nativeDecision = $modelDecisionStrategy === AgentModelDecisionConfig::STRATEGY_NATIVE;
 
-				$message = 'Agent, chat model preset, Evolution tool profile and orchestrator profile are configured.';
+				$message = 'Agent, chat model preset, Evolution tool profile, single approval-bound apply-plan tool and orchestrator profile are configured.';
 				$status = 'ok';
 				if ($lowLoopLimit) {
 					$status = 'warning';
-					$message = 'Agent configuration is valid, but orchestrator profile "' . $orchestratorProfileId . '" allows only ' . $maxToolLoops . ' tool loops. Evolution recommends a dedicated governed profile with at least 16 loops; the bundled profile uses 32.';
+					$message = 'Agent configuration is valid, but orchestrator profile "' . $orchestratorProfileId . '" allows only ' . $maxToolLoops . ' tool loops. Evolution recommends at least 16 loops; the bundled profile uses 32.';
 				}
 				elseif (!$nativeDecision) {
 					$status = 'warning';
-					$message = 'Agent configuration is valid, but Evolution recommends MissionBay native-model-decision so the terminal tool-loop response is reused directly instead of requiring a separate final-response model call.';
+					$message = 'Agent configuration is valid, but Evolution recommends MissionBay native-model-decision so the terminal tool-loop response is reused directly.';
+				}
+				elseif (!$contextCompaction) {
+					$status = 'warning';
+					$message = 'Agent configuration is valid, but the effective MissionBay pipeline has context-compaction disabled. Evolution repository analysis should keep this existing MissionBay stage enabled.';
 				}
 
 				return [
@@ -275,7 +308,10 @@ final class EvolutionHealthService {
 						'llm_service' => $llmServiceId,
 						'orchestrator_profile' => $orchestratorProfileId,
 						'max_tool_loops' => $maxToolLoops,
-						'model_decision' => $modelDecisionStrategy
+						'model_decision' => $modelDecisionStrategy,
+						'deliberate_planning' => $deliberatePlanning,
+						'context_compaction' => $contextCompaction,
+						'stage_ids' => $stageIds
 					]
 				];
 			}, $analysisReady, $applyReady, true, true);
@@ -399,6 +435,18 @@ final class EvolutionHealthService {
 			$this->requireService(ILogger::class, ILogger::class, 'Wire ILogger in the Website project plugin.');
 			return ['message' => 'ILogger is registered.'];
 		}, $analysisReady, $applyReady, false, false);
+
+		$this->runCheck($checks, 'php_cli', 'PHP CLI', function(): array {
+			$binary = $this->workspace->getPhpCliBinary();
+			return [
+				'message' => 'PHP CLI executable is available for linting and local test execution.',
+				'details' => [
+					'binary' => $binary,
+					'runtime_binary' => PHP_BINARY,
+					'runtime_sapi' => PHP_SAPI
+				]
+			];
+		}, $analysisReady, $applyReady, false, true);
 
 		$this->runCheck($checks, 'phpunit', 'Tests', function(): array {
 			if (!$this->workspace->hasPhpUnit()) {

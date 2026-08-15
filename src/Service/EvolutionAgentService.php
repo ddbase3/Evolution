@@ -21,7 +21,9 @@ final class EvolutionAgentService {
 	private const CHANGE_KEY_PREFIX = 'evolution.change.';
 	private const APPLY_LOCK_KEY = 'locks.evolution.apply';
 	private const CHANGE_TTL_SECONDS = 86400;
+	private const CHANGE_FORMAT_VERSION = 5;
 	private const APPLY_LOCK_TTL_SECONDS = 1800;
+	private const APPLY_PLAN_TOOL = 'evolution_apply_plan';
 
 	public function __construct(
 		private readonly EvolutionConfiguration $configuration,
@@ -48,35 +50,29 @@ final class EvolutionAgentService {
 			'analyze',
 			$this->buildAnalyzeInstruction($prompt),
 			[
-				'evolution_mode' => 'analyze',
+				'evolution_mode' => 'plan',
 				'evolution_workspace' => $this->configuration->getWorkspace(),
 				'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
 			]
 		);
-		$this->assertSuccessfulAgentResult($result, 'analysis');
 
-		$plan = trim($this->extractAssistantText($result));
-		if ($plan === '') {
-			throw new RuntimeException('MissionBay agent returned no change plan.');
+		if ($result->getAgentResult()?->isSuspended()) {
+			return $this->storePlannedChange(
+				$this->requireStateStore(),
+				$prompt,
+				$baseHead,
+				$baseSourceFingerprint,
+				$result
+			);
 		}
 
-		$changeId = bin2hex(random_bytes(12));
-		$state = $this->requireStateStore();
-		$state->set(self::CHANGE_KEY_PREFIX . $changeId, [
-			'id' => $changeId,
-			'status' => 'planned',
-			'prompt' => $prompt,
-			'plan' => $plan,
-			'base_head' => $baseHead,
-			'base_source_fingerprint' => $baseSourceFingerprint,
-			'created_at' => time(),
-			'warnings' => $result->getWarnings()
-		], self::CHANGE_TTL_SECONDS);
-
+		$this->assertSuccessfulAgentResult($result, 'analysis');
+		$blocker = $this->parseBlockedAnalysis($this->extractAssistantText($result));
 		return [
 			'ok' => true,
-			'change_id' => $changeId,
-			'plan' => $plan,
+			'applicable' => false,
+			'change_id' => '',
+			'plan' => $blocker,
 			'base_head' => $baseHead,
 			'warnings' => $result->getWarnings()
 		];
@@ -93,8 +89,15 @@ final class EvolutionAgentService {
 
 		$state = $this->requireStateStore();
 		$change = $this->loadChange($state, $changeId);
+		$this->assertCurrentChangeFormat($change);
 		if (($change['status'] ?? '') !== 'planned') {
 			throw new RuntimeException('Evolution change is not in planned state: ' . (string)($change['status'] ?? 'unknown'));
+		}
+
+		$resumeHandle = trim((string)($change['resume_handle'] ?? ''));
+		$requestId = trim((string)($change['interaction_request_id'] ?? ''));
+		if ($resumeHandle === '' || $requestId === '') {
+			throw new RuntimeException('Evolution change has no resumable MissionBay plan approval. Re-run analysis.');
 		}
 
 		$this->acquireApplyLock($state, $changeId);
@@ -109,18 +112,39 @@ final class EvolutionAgentService {
 			]);
 			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
 
+			$resume = new AgentResume($resumeHandle, [
+				new AgentInteractionResponse($requestId, AgentInteractionResponse::DECISION_APPROVE)
+			]);
 			$result = $this->executeAgent(
 				'apply',
-				$this->buildApplyInstruction($change),
-				$this->buildApplyContext($changeId)
+				'',
+				[
+					'evolution_mode' => 'apply',
+					'evolution_change_id' => $changeId,
+					'evolution_workspace' => $this->configuration->getWorkspace(),
+					'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
+				],
+				$resume
 			);
 
-			if ($result->getAgentResult()?->isSuspended()) {
-				return $this->storeSuspendedApply($state, $change, $changeId, $result);
+			$execution = $this->findApplyPlanExecution($result);
+			if ($execution === null) {
+				$this->assertSuccessfulAgentResult($result, 'apply');
+				throw new RuntimeException('MissionBay resumed the approved Evolution plan without executing the stored apply-plan tool call.');
+			}
+			if (($execution['ok'] ?? false) !== true) {
+				$error = trim((string)($execution['error'] ?? 'Approved Evolution plan execution failed.'));
+				throw new RuntimeException($error !== '' ? $error : 'Approved Evolution plan execution failed.');
 			}
 
-			$this->assertSuccessfulAgentResult($result, 'apply');
-			return $this->finalizeAppliedChange($state, $change, $changeId, $result, $baseGitSnapshot);
+			return $this->finalizeAppliedChange(
+				$state,
+				$change,
+				$changeId,
+				$result,
+				$baseGitSnapshot,
+				$this->getAgentCompletionWarning($result)
+			);
 		} catch (Throwable $e) {
 			$this->markApplyFailed($state, $change, $changeId, $baseGitSnapshot, $e);
 			throw new RuntimeException($e->getMessage(), 0, $e);
@@ -131,75 +155,12 @@ final class EvolutionAgentService {
 
 	/** @return array<string,mixed> */
 	public function approveApply(string $changeId, string $resumeHandle): array {
-		$changeId = $this->normalizeChangeId($changeId);
-		$resumeHandle = trim($resumeHandle);
-		if ($resumeHandle === '') {
-			throw new RuntimeException('Missing MissionBay resume handle for Evolution approval.');
-		}
-
-		$state = $this->requireStateStore();
-		$change = $this->loadChange($state, $changeId);
-		if (($change['status'] ?? '') !== 'awaiting_approval') {
-			throw new RuntimeException('Evolution change is not awaiting approval: ' . (string)($change['status'] ?? 'unknown'));
-		}
+		$change = $this->loadChange($this->requireStateStore(), $this->normalizeChangeId($changeId));
 		$storedHandle = trim((string)($change['resume_handle'] ?? ''));
-		if ($storedHandle === '' || !hash_equals($storedHandle, $resumeHandle)) {
-			throw new RuntimeException('Evolution approval resume handle does not match the pending change.');
+		if ($storedHandle === '' || !hash_equals($storedHandle, trim($resumeHandle))) {
+			throw new RuntimeException('Evolution approval resume handle does not match the planned change.');
 		}
-
-		$requests = is_array($change['interaction_requests'] ?? null) ? $change['interaction_requests'] : [];
-		if ($requests === []) {
-			throw new RuntimeException('Evolution change has no pending MissionBay approval requests.');
-		}
-
-		$responses = [];
-		foreach ($requests as $request) {
-			if (!is_array($request)) {
-				throw new RuntimeException('Stored MissionBay approval request is invalid.');
-			}
-			$requestId = trim((string)($request['id'] ?? ''));
-			$kind = trim((string)($request['kind'] ?? ''));
-			if ($requestId === '' || $kind !== AgentInteractionRequest::KIND_APPROVAL) {
-				throw new RuntimeException('Evolution v1 can resume only explicit MissionBay approval requests.');
-			}
-			$responses[] = new AgentInteractionResponse(
-				$requestId,
-				AgentInteractionResponse::DECISION_APPROVE
-			);
-		}
-
-		$this->acquireApplyLock($state, $changeId);
-		$baseGitSnapshot = is_array($change['base_git_snapshot'] ?? null) ? $change['base_git_snapshot'] : [];
-		try {
-			$this->workspace->assertSourceFingerprint(trim((string)($change['resume_source_fingerprint'] ?? '')));
-			$resume = new AgentResume($resumeHandle, $responses);
-			$change = array_merge($change, [
-				'status' => 'applying',
-				'resume_handle' => '',
-				'interaction_requests' => [],
-				'resume_started_at' => time()
-			]);
-			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
-
-			$result = $this->executeAgent(
-				'apply',
-				'Continue the approved Evolution apply operation from the persisted MissionBay suspension.',
-				$this->buildApplyContext($changeId),
-				$resume
-			);
-
-			if ($result->getAgentResult()?->isSuspended()) {
-				return $this->storeSuspendedApply($state, $change, $changeId, $result);
-			}
-
-			$this->assertSuccessfulAgentResult($result, 'apply resume');
-			return $this->finalizeAppliedChange($state, $change, $changeId, $result, $baseGitSnapshot);
-		} catch (Throwable $e) {
-			$this->markApplyFailed($state, $change, $changeId, $baseGitSnapshot, $e);
-			throw new RuntimeException($e->getMessage(), 0, $e);
-		} finally {
-			$this->releaseApplyLock($state);
-		}
+		return $this->apply($changeId);
 	}
 
 	/** @return array<string,mixed> */
@@ -219,9 +180,9 @@ final class EvolutionAgentService {
 
 		$result = $this->executeAgent(
 			'analyze',
-			'Diagnostic run only. Call evolution_workspace_info exactly once. After the tool result, reply exactly with EVOLUTION_AGENT_OK. Do not call mutation tools.',
+			'Diagnostic run only. Call evolution_workspace_info exactly once. After the tool result, reply exactly with EVOLUTION_AGENT_OK. Do not call evolution_apply_plan.',
 			[
-				'evolution_mode' => 'analyze',
+				'evolution_mode' => 'diagnostic',
 				'evolution_workspace' => $this->configuration->getWorkspace(),
 				'evolution_write_root' => $this->configuration->getWorkspacePluginPath(),
 				'evolution_diagnostic' => true
@@ -286,107 +247,162 @@ final class EvolutionAgentService {
 		return $executionService->execute($request);
 	}
 
-	/** @param array<string,mixed> $change */
-	private function buildApplyInstruction(array $change): string {
-		return "Implement the approved EvolutionWorkspace change now.\n\n"
-			. "Original user request:\n" . trim((string)($change['prompt'] ?? '')) . "\n\n"
-			. "Approved plan:\n" . trim((string)($change['plan'] ?? '')) . "\n\n"
-			. "Mutation is restricted to plugin/EvolutionWorkspace. Implement the approved plan there; do not merely describe code. "
-			. "Read other BASE3 source only when needed as a contract or implementation reference. Keep plugin init() limited to composition, preserve local coding conventions, and do not modify existing migrations. "
-			. "Run the available validation tools before the final response.";
-	}
-
 	private function buildAnalyzeInstruction(string $prompt): string {
-		return "Analyze this requested change for plugin/EvolutionWorkspace without modifying files:\n\n"
+		return "Analyze this requested change for plugin/EvolutionWorkspace without executing source mutations:\n\n"
 			. $prompt
 			. "\n\nStart with plugin/EvolutionWorkspace. Search before listing broad trees and read only the files needed to understand the requested change. "
-			. "Inspect BASE3 framework, MissionBay, other plugins, settings or database schema only when the requested change actually depends on them. Stop exploring once the relevant contract and local implementation pattern are clear. "
-			. "Return a concise concrete implementation plan with files to create/change/delete, composition or ClassMap impact, migration impact only when relevant, and validation steps. "
-			. "All planned source mutations must stay inside plugin/EvolutionWorkspace. If the request cannot be implemented safely with that boundary, state the exact blocker.";
+			. "BASE3 framework source lives below the application src/ tree; never invent vendor paths. For every BASE3 interface, abstract class or framework API that the implementation depends on, search the current application source and inspect its exact signature before proposing code. Do not infer missing methods, parameters, return types or registration requirements. "
+			. "ClassMap-discoverable components do not need container registration solely for discovery. Modify plugin init() only when the inspected implementation proves actual service composition is required. "
+			. "When the change is fully understood and implementable, do NOT return a textual READY plan. Instead call evolution_apply_plan exactly once with the complete final mutation set. Every write operation must contain the complete target file content. Every target path may occur only once. That tool is approval-bound: MissionBay will suspend before executing it, and the host will render its exact arguments as the proposed plan. "
+			. "If an exact blocker remains, do not call evolution_apply_plan. Return exactly STATUS: BLOCKED, a blank line, and the concise blocker explanation. "
+			. "Do not call evolution_apply_plan merely to test it. Once the tool call is emitted, analysis is complete.";
 	}
 
-	private function storeSuspendedApply(
+	/** @return array<string,mixed> */
+	private function storePlannedChange(
 		IStateStore $state,
-		array $change,
-		string $changeId,
+		string $prompt,
+		string $baseHead,
+		string $baseSourceFingerprint,
 		AgentExecutionResult $result
 	): array {
 		$agentResult = $result->getAgentResult();
 		$suspension = $agentResult?->getState()->getSuspension();
 		if ($agentResult === null || !$agentResult->isSuspended() || $suspension === null || !$suspension->isSuspended()) {
-			throw new RuntimeException('MissionBay reported a suspended Evolution run without suspension state.');
+			throw new RuntimeException('MissionBay reported a suspended Evolution analysis without suspension state.');
 		}
 		if ($suspension->getStatus() !== 'awaiting_approval') {
-			throw new RuntimeException('Evolution v1 supports only MissionBay approval suspensions, received: ' . $suspension->getStatus());
+			throw new RuntimeException('Evolution planning expects a MissionBay approval suspension, received: ' . $suspension->getStatus());
 		}
 
+		$requests = $suspension->getInteractionRequests();
+		if (count($requests) !== 1 || !$requests[0] instanceof AgentInteractionRequest) {
+			throw new RuntimeException('Evolution planning requires exactly one MissionBay apply-plan approval request.');
+		}
+		$request = $requests[0];
+		if ($request->getKind() !== AgentInteractionRequest::KIND_APPROVAL) {
+			throw new RuntimeException('Evolution planning received a non-approval MissionBay interaction.');
+		}
+		$action = $request->getAction();
+		if (!$this->isApplyPlanToolName($action->getName())) {
+			throw new RuntimeException('Evolution analysis may suspend only for the complete apply-plan tool, received: ' . $action->getName());
+		}
+
+		$input = $action->getInput();
+		$summary = trim((string)($input['summary'] ?? ''));
+		if ($summary === '') {
+			throw new RuntimeException('Evolution apply-plan tool call contains no plan summary.');
+		}
+		$operations = is_array($input['operations'] ?? null) ? $input['operations'] : [];
+		$operations = $this->workspace->validatePlanOperations($operations);
+		$plan = $this->formatPlan($summary, $operations);
 		$resumeHandle = trim($suspension->getResumeHandle());
 		if ($resumeHandle === '') {
-			throw new RuntimeException('MissionBay approval suspension has no resume handle.');
+			throw new RuntimeException('MissionBay plan approval suspension has no resume handle.');
 		}
 
-		$publicRequests = [];
-		$storedRequests = [];
-		foreach ($suspension->getInteractionRequests() as $request) {
-			if (!$request instanceof AgentInteractionRequest) {
-				throw new RuntimeException('MissionBay approval suspension contains an invalid interaction request.');
-			}
-			if ($request->getKind() !== AgentInteractionRequest::KIND_APPROVAL) {
-				throw new RuntimeException('Evolution v1 supports only explicit MissionBay approval requests.');
-			}
-			$storedRequests[] = [
-				'id' => $request->getId(),
-				'kind' => $request->getKind()
-			];
-			$publicRequests[] = [
-				'id' => $request->getId(),
-				'kind' => $request->getKind(),
-				'action' => $request->getAction()->getName(),
-				'title' => $request->getTitle(),
-				'message' => $request->getMessage(),
-				'summary' => $this->normalizeApprovalSummary($request->getSummary()),
-				'risk' => $request->getRisk()
-			];
-		}
-		if ($storedRequests === []) {
-			throw new RuntimeException('MissionBay approval suspension contains no interaction requests.');
-		}
-
-		$change = array_merge($change, [
-			'status' => 'awaiting_approval',
+		$changeId = bin2hex(random_bytes(12));
+		$change = [
+			'id' => $changeId,
+			'format_version' => self::CHANGE_FORMAT_VERSION,
+			'status' => 'planned',
+			'prompt' => $prompt,
+			'plan' => $plan,
+			'plan_summary' => $summary,
+			'operations' => $operations,
+			'base_head' => $baseHead,
+			'base_source_fingerprint' => $baseSourceFingerprint,
 			'resume_handle' => $resumeHandle,
-			'interaction_requests' => $storedRequests,
-			'resume_source_fingerprint' => $this->workspace->createSourceFingerprint(),
-			'approval_requested_at' => time(),
+			'interaction_request_id' => $request->getId(),
+			'action_fingerprint' => $request->getActionFingerprint(),
+			'created_at' => time(),
 			'warnings' => $result->getWarnings()
-		]);
+		];
 		$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
 
 		return [
 			'ok' => true,
-			'status' => 'awaiting_approval',
-			'message' => 'MissionBay requires approval for the concrete pending source mutation before execution.',
+			'applicable' => true,
 			'change_id' => $changeId,
-			'resume_handle' => $resumeHandle,
-			'interaction_requests' => $publicRequests,
+			'plan' => $plan,
+			'base_head' => $baseHead,
+			'operation_count' => count($operations),
 			'warnings' => $result->getWarnings()
 		];
 	}
 
-	/** @param array<string,mixed> $summary @return array<string,mixed> */
-	private function normalizeApprovalSummary(array $summary): array {
-		$result = [];
-		foreach ($summary as $key => $value) {
-			if (is_scalar($value) || $value === null) {
-				$text = $value === null ? 'Not specified' : (string)$value;
-				$result[(string)$key] = strlen($text) > 1200 ? substr($text, 0, 1200) . '…' : $text;
+	private function parseBlockedAnalysis(string $text): string {
+		$text = trim($text);
+		if ($text === '') {
+			throw new RuntimeException('MissionBay analysis ended without submitting an apply plan or blocker.');
+		}
+		$lines = preg_split('/\R/', $text, 2);
+		$marker = strtoupper(trim((string)($lines[0] ?? '')));
+		$detail = trim((string)($lines[1] ?? ''));
+		if ($marker !== 'STATUS: BLOCKED' || $detail === '') {
+			throw new RuntimeException('MissionBay analysis completed without calling evolution_apply_plan. Implementable changes must be submitted through that approval-bound plan tool; blockers must begin with STATUS: BLOCKED.');
+		}
+		return $detail;
+	}
+
+	/** @param array<int,array<string,mixed>> $operations */
+	private function formatPlan(string $summary, array $operations): string {
+		$lines = [$summary, '', 'Operations:'];
+		foreach ($operations as $index => $operation) {
+			$action = strtoupper((string)$operation['action']);
+			$path = (string)$operation['path'];
+			$reason = trim((string)($operation['reason'] ?? ''));
+			$line = ($index + 1) . '. ' . $action . ' ' . $path;
+			if ($action === 'WRITE') {
+				$content = (string)($operation['content'] ?? '');
+				$line .= ' (' . strlen($content) . ' bytes, sha256 ' . substr(hash('sha256', $content), 0, 16) . '…)';
+			}
+			if ($reason !== '') {
+				$line .= "\n   " . $reason;
+			}
+			$lines[] = $line;
+		}
+		return implode("\n", $lines);
+	}
+
+	/** @return ?array<string,mixed> */
+	private function findApplyPlanExecution(AgentExecutionResult $result): ?array {
+		$execution = $result->getAgentResult()?->getState()->getExecution();
+		$calls = $execution?->getExecutedToolCalls() ?? [];
+		$match = null;
+		foreach ($calls as $entry) {
+			if (!is_array($entry)) {
 				continue;
 			}
-			$json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-			$text = is_string($json) ? $json : get_debug_type($value);
-			$result[(string)$key] = strlen($text) > 1200 ? substr($text, 0, 1200) . '…' : $text;
+			$name = trim((string)($entry['tool'] ?? ''));
+			if (!$this->isApplyPlanToolName($name)) {
+				continue;
+			}
+			if (isset($entry['error'])) {
+				$match = [
+					'ok' => false,
+					'error' => (string)$entry['error'],
+					'entry' => $entry
+				];
+				continue;
+			}
+			$toolResult = is_array($entry['result'] ?? null) ? $entry['result'] : [];
+			if (($toolResult['ok'] ?? false) !== true) {
+				$match = [
+					'ok' => false,
+					'error' => trim((string)($toolResult['error'] ?? 'Evolution apply-plan tool returned an unsuccessful result.')),
+					'entry' => $entry
+				];
+				continue;
+			}
+			$match = ['ok' => true, 'entry' => $entry, 'result' => $toolResult];
 		}
-		return $result;
+		return $match;
+	}
+
+	private function isApplyPlanToolName(string $name): bool {
+		$name = trim($name);
+		return $name === self::APPLY_PLAN_TOOL || str_ends_with($name, '__' . self::APPLY_PLAN_TOOL);
 	}
 
 	/** @param array<string,mixed> $change @param array<string,mixed> $baseGitSnapshot @return array<string,mixed> */
@@ -395,12 +411,13 @@ final class EvolutionAgentService {
 		array $change,
 		string $changeId,
 		AgentExecutionResult $result,
-		array $baseGitSnapshot
+		array $baseGitSnapshot,
+		string $agentWarning = ''
 	): array {
 		$baseHead = trim((string)($baseGitSnapshot['head'] ?? ''));
 		$changedPaths = $this->configuration->isGitRequired() ? $this->workspace->getChangedPaths($baseHead) : [];
 		if ($this->configuration->isGitRequired() && $changedPaths === []) {
-			throw new RuntimeException('Apply completed without EvolutionWorkspace source changes. The approved plan was not implemented.');
+			throw new RuntimeException('Approved Evolution plan executed without producing EvolutionWorkspace source changes.');
 		}
 
 		$validation = $this->validateAppliedChange($baseHead);
@@ -411,10 +428,11 @@ final class EvolutionAgentService {
 				'apply_finished_at' => time(),
 				'validation' => $validation,
 				'rollback' => $rollback,
-				'agent_output' => $this->extractAssistantText($result),
+				'agent_output' => $this->extractAssistantTextBestEffort($result),
+				'agent_warning' => $agentWarning,
 				'warnings' => $result->getWarnings(),
 				'resume_handle' => '',
-				'interaction_requests' => []
+				'interaction_request_id' => ''
 			]);
 			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $failed, self::CHANGE_TTL_SECONDS);
 			return [
@@ -432,22 +450,28 @@ final class EvolutionAgentService {
 			'apply_finished_at' => time(),
 			'validation' => $validation,
 			'changed_paths' => $changedPaths,
-			'agent_output' => $this->extractAssistantText($result),
+			'agent_output' => $this->extractAssistantTextBestEffort($result),
+			'agent_warning' => $agentWarning,
 			'warnings' => $result->getWarnings(),
 			'resume_handle' => '',
-			'interaction_requests' => []
+			'interaction_request_id' => ''
 		]);
 		$state->set(self::CHANGE_KEY_PREFIX . $changeId, $done, self::CHANGE_TTL_SECONDS);
 
+		$message = 'Approved EvolutionWorkspace plan was applied and validated.';
+		if ($agentWarning !== '') {
+			$message .= ' The source mutation succeeded; MissionBay reported a non-essential completion warning afterwards: ' . $agentWarning;
+		}
 		return [
 			'ok' => true,
 			'status' => 'applied',
-			'message' => 'Approved EvolutionWorkspace change was applied and validated.',
+			'message' => $message,
 			'change_id' => $changeId,
 			'changed_paths' => $changedPaths,
 			'diff' => $diff,
 			'validation' => $validation,
-			'agent_output' => $this->extractAssistantText($result),
+			'agent_output' => $this->extractAssistantTextBestEffort($result),
+			'agent_warning' => $agentWarning,
 			'warnings' => $result->getWarnings()
 		];
 	}
@@ -470,18 +494,8 @@ final class EvolutionAgentService {
 			'error' => $error->getMessage(),
 			'rollback' => $rollback,
 			'resume_handle' => '',
-			'interaction_requests' => []
+			'interaction_request_id' => ''
 		]), self::CHANGE_TTL_SECONDS);
-	}
-
-	/** @return array<string,mixed> */
-	private function buildApplyContext(string $changeId): array {
-		return [
-			'evolution_mode' => 'apply',
-			'evolution_change_id' => $changeId,
-			'evolution_workspace' => $this->configuration->getWorkspace(),
-			'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
-		];
 	}
 
 	private function normalizeChangeId(string $changeId): string {
@@ -499,6 +513,14 @@ final class EvolutionAgentService {
 			throw new RuntimeException('Evolution change plan was not found or has expired: ' . $changeId);
 		}
 		return $change;
+	}
+
+	/** @param array<string,mixed> $change */
+	private function assertCurrentChangeFormat(array $change): void {
+		if ((int)($change['format_version'] ?? 0) === self::CHANGE_FORMAT_VERSION) {
+			return;
+		}
+		throw new RuntimeException('This Evolution change was analyzed before the single-run plan/apply format. Re-run Analyze change before Apply.');
 	}
 
 	private function acquireApplyLock(IStateStore $state, string $changeId): void {
@@ -556,24 +578,20 @@ final class EvolutionAgentService {
 			$failureCode = trim((string)($resultState?->getFailureCode() ?? ''));
 			$failureMessage = trim((string)($resultState?->getFailureMessage() ?? ''));
 			$failureDetail = $resultState?->getFailureDetail() ?? [];
-
 			if ($failureMessage === '') {
 				$metadata = $agentResult->getMetadata();
 				$failureMessage = trim((string)($metadata['error'] ?? $metadata['message'] ?? 'Agent runtime reported a failed execution.'));
 			}
-
-			$parts = ['MissionBay agent ' . $phase . ' failed'];
+			$message = 'MissionBay agent ' . $phase . ' failed';
 			if ($failureCode !== '') {
-				$parts[0] .= ' [' . $failureCode . ']';
+				$message .= ' [' . $failureCode . ']';
 			}
-			$parts[0] .= ': ' . $failureMessage;
-
+			$message .= ': ' . $failureMessage;
 			$detail = $this->formatFailureDetail($failureDetail);
 			if ($detail !== '') {
-				$parts[] = 'Detail: ' . $detail;
+				$message .= "\nDetail: " . $detail;
 			}
-
-			throw new RuntimeException(implode("\n", $parts));
+			throw new RuntimeException($message);
 		}
 
 		$output = $result->getOutput();
@@ -582,30 +600,40 @@ final class EvolutionAgentService {
 		if (is_scalar($error) && trim((string)$error) !== '') {
 			throw new RuntimeException('MissionBay agent ' . $phase . ' failed: ' . trim((string)$error));
 		}
-
-		$warning = is_scalar($assistant['warning'] ?? null)
-			? trim((string)$assistant['warning'])
-			: '';
+		$warning = is_scalar($assistant['warning'] ?? null) ? trim((string)$assistant['warning']) : '';
 		if ($warning !== '') {
 			$status = is_scalar($assistant['status'] ?? null)
 				? trim((string)$assistant['status'])
 				: ($agentResult?->getStatus() ?? 'unknown');
-			$message = 'MissionBay agent ' . $phase . ' did not produce a complete final response [' . $warning . ']. '
-				. 'Status: ' . ($status !== '' ? $status : 'unknown') . '. No Evolution change plan was stored.';
-
+			$message = 'MissionBay agent ' . $phase . ' did not produce a complete final response [' . $warning . ']. Status: ' . ($status !== '' ? $status : 'unknown') . '.';
 			$partialDetail = $this->getPartialResponseDetail($agentResult);
 			if ($partialDetail !== '') {
 				$message .= ' Detail: ' . $partialDetail;
 			}
-
 			throw new RuntimeException($message);
 		}
-
 		if ($agentResult !== null && !$agentResult->isCompleted()) {
-			throw new RuntimeException(
-				'MissionBay agent ' . $phase . ' ended with non-terminal status: ' . $agentResult->getStatus() . '.'
-			);
+			throw new RuntimeException('MissionBay agent ' . $phase . ' ended with non-terminal status: ' . $agentResult->getStatus() . '.');
 		}
+	}
+
+	private function getAgentCompletionWarning(AgentExecutionResult $result): string {
+		$agentResult = $result->getAgentResult();
+		if ($agentResult?->hasFailure()) {
+			$resultState = $agentResult->getState()->getResult();
+			$code = trim((string)($resultState?->getFailureCode() ?? ''));
+			$message = trim((string)($resultState?->getFailureMessage() ?? ''));
+			$detail = $this->formatFailureDetail($resultState?->getFailureDetail() ?? []);
+			$text = trim(($code !== '' ? '[' . $code . '] ' : '') . $message);
+			if ($detail !== '') {
+				$text .= ($text !== '' ? ' ' : '') . $detail;
+			}
+			return trim($text);
+		}
+		$output = $result->getOutput();
+		$assistant = is_array($output['assistant'] ?? null) ? $output['assistant'] : [];
+		$warning = is_scalar($assistant['warning'] ?? null) ? trim((string)$assistant['warning']) : '';
+		return $warning;
 	}
 
 	private function getPartialResponseDetail(?AgentResult $agentResult): string {
@@ -613,44 +641,27 @@ final class EvolutionAgentService {
 		if ($execution === null) {
 			return '';
 		}
-
 		$trace = array_reverse($execution->getStageTrace());
 		foreach ($trace as $entry) {
 			if (!$entry instanceof AgentStageTraceEntry) {
 				continue;
 			}
-
 			$metadata = $entry->getMetadata();
-			if (($metadata['recovered_from_model_error'] ?? false) !== true) {
+			$error = trim((string)($metadata['error_message'] ?? $metadata['error'] ?? ''));
+			if ($error === '') {
 				continue;
 			}
-
-			$parts = [
-				'stage=' . $entry->getStageName(),
-				'iteration=' . $entry->getIteration()
-			];
-
-			$errorType = trim((string)($metadata['error_type'] ?? ''));
-			if ($errorType !== '') {
-				$parts[] = 'error_type=' . $errorType;
+			$parts = ['stage=' . $entry->getStageId()];
+			if (isset($metadata['iteration'])) {
+				$parts[] = 'iteration=' . (string)$metadata['iteration'];
 			}
-
-			$errorMessage = trim((string)($metadata['error_message'] ?? ''));
-			if ($errorMessage !== '') {
-				$parts[] = 'error=' . $errorMessage;
+			if (isset($metadata['error_type'])) {
+				$parts[] = 'error_type=' . (string)$metadata['error_type'];
 			}
-
-			$errorCode = $metadata['error_code'] ?? null;
-			if (is_scalar($errorCode) && trim((string)$errorCode) !== '') {
-				$parts[] = 'error_code=' . (string)$errorCode;
-			}
-
+			$parts[] = 'error=' . $error;
 			return implode(', ', $parts);
 		}
-
-		return 'iteration=' . $execution->getIteration()
-			. '/' . $execution->getMaxIterations()
-			. ', executed_tool_calls=' . count($execution->getExecutedToolCalls());
+		return '';
 	}
 
 	/** @param array<string,mixed> $detail */
@@ -658,29 +669,30 @@ final class EvolutionAgentService {
 		if ($detail === []) {
 			return '';
 		}
-
 		$message = $detail['message'] ?? null;
 		if (is_scalar($message) && trim((string)$message) !== '') {
 			return trim((string)$message);
 		}
-
 		$json = json_encode($detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-		if (!is_string($json) || $json === '{}' || $json === 'null') {
-			return '';
-		}
-
-		return $json;
+		return is_string($json) && $json !== '{}' && $json !== 'null' ? $json : '';
 	}
 
 	private function extractAssistantText(AgentExecutionResult $result): string {
 		$this->assertSuccessfulAgentResult($result, 'execution');
+		$text = $this->extractAssistantTextBestEffort($result);
+		if ($text === '') {
+			$status = $result->getAgentResult()?->getStatus() ?? 'unknown';
+			throw new RuntimeException('MissionBay agent returned no assistant message. Status: ' . $status . '.');
+		}
+		return $text;
+	}
 
+	private function extractAssistantTextBestEffort(AgentExecutionResult $result): string {
 		$output = $result->getOutput();
 		$agentResult = $result->getAgentResult();
 		if ($output === [] && $agentResult !== null) {
 			$output = $agentResult->getOutput();
 		}
-
 		$assistant = is_array($output['assistant'] ?? null) ? $output['assistant'] : [];
 		$message = $assistant['message'] ?? null;
 		if (is_array($message)) {
@@ -692,56 +704,24 @@ final class EvolutionAgentService {
 		if (is_scalar($message)) {
 			return trim((string)$message);
 		}
-
 		$content = $this->normalizeMessageContent($assistant['content'] ?? null);
-		if ($content !== '') {
-			return trim($content);
-		}
-
-		$error = $assistant['error'] ?? ($output['error'] ?? null);
-		if (is_scalar($error) && trim((string)$error) !== '') {
-			throw new RuntimeException('MissionBay agent failed: ' . trim((string)$error));
-		}
-
-		if ($agentResult?->hasFailure()) {
-			$metadata = $agentResult->getMetadata();
-			$error = trim((string)($metadata['error'] ?? $metadata['message'] ?? 'Agent runtime reported a failed execution.'));
-			throw new RuntimeException('MissionBay agent failed: ' . $error);
-		}
-
-		$terminalNodes = array_values(array_filter(
-			array_map('strval', array_keys($output)),
-			static fn(string $nodeId): bool => $nodeId !== ''
-		));
-		$status = $agentResult?->getStatus() ?? 'unknown';
-		$details = $terminalNodes === []
-			? 'No terminal node output was returned.'
-			: 'Terminal nodes: ' . implode(', ', $terminalNodes) . '.';
-
-		throw new RuntimeException(
-			'MissionBay agent returned no assistant message. Status: ' . $status . '. ' . $details
-		);
+		return $content !== '' ? trim($content) : '';
 	}
 
 	private function normalizeMessageContent(mixed $content): string {
 		if ($content === null) {
 			return '';
 		}
-
 		if (is_string($content)) {
 			return $content;
 		}
-
 		if (is_bool($content)) {
 			return $content ? 'true' : 'false';
 		}
-
 		if (is_int($content) || is_float($content)) {
 			return (string)$content;
 		}
-
 		$json = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
 		return is_string($json) && $json !== 'null' ? $json : '';
 	}
 

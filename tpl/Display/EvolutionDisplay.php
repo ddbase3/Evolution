@@ -121,7 +121,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			<div class="ev-panel-head">
 				<div>
 					<h2>Requested change</h2>
-					<div class="ev-status-text">Analysis is read-only. Apply may mutate only plugin/EvolutionWorkspace.</div>
+					<div class="ev-status-text">Analysis is read-only. Apply approves and resumes the exact MissionBay plan and may mutate only plugin/EvolutionWorkspace.</div>
 				</div>
 			</div>
 			<div class="ev-panel-body">
@@ -145,20 +145,13 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			</div>
 			<div class="ev-panel-body">
 				<div class="ev-message" data-role="apply-message"></div>
-				<div class="ev-approval" data-role="approval-panel">
-					<div class="ev-approval-title">MissionBay approval required</div>
-					<div data-role="approval-requests"></div>
-					<div class="ev-actions" style="margin-top:12px;">
-						<button type="button" class="danger" data-action="approve-pending">Approve pending action(s)</button>
-					</div>
-				</div>
 				<pre class="ev-plan" data-role="plan"></pre>
 				<div class="ev-meta"><span data-role="change-id"></span><span data-role="base-head"></span></div>
 			</div>
 		</div>
 
 		<div class="ev-panel ev-output" data-role="result-panel">
-			<div class="ev-panel-head"><h2>Applied change</h2></div>
+			<div class="ev-panel-head"><h2>Workspace diff</h2></div>
 			<div class="ev-panel-body">
 				<div class="ev-message" data-role="result-message"></div>
 				<div class="ev-status-text" style="margin-bottom:7px;">Changed source</div>
@@ -175,7 +168,6 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		var actionUrl = <?php echo $actionUrlJson ?: '"index.php?name=evolutionaction&out=json"'; ?>;
 		var health = <?php echo $healthJson ?: '{}'; ?>;
 		var currentChangeId = '';
-		var currentResumeHandle = '';
 
 		function el(role) { return root.querySelector('[data-role="' + role + '"]'); }
 		function button(action) { return root.querySelector('[data-action="' + action + '"]'); }
@@ -199,45 +191,15 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		function escapeHtml(value) {
 			return String(value).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[c]; });
 		}
-		function clearApproval() {
-			currentResumeHandle = '';
-			el('approval-requests').innerHTML = '';
-			el('approval-panel').classList.remove('visible');
-		}
-		function renderApproval(result) {
-			currentResumeHandle = result.resume_handle || '';
-			var requests = Array.isArray(result.interaction_requests) ? result.interaction_requests : [];
-			var markup = '';
-			requests.forEach(function(request) {
-				var summary = request && request.summary && typeof request.summary === 'object' ? request.summary : {};
-				var summaryMarkup = '';
-				Object.keys(summary).forEach(function(key) {
-					summaryMarkup += '<div class="ev-approval-key">' + escapeHtml(key) + '</div><div class="ev-approval-value">' + escapeHtml(summary[key]) + '</div>';
-				});
-				markup += '<div class="ev-approval-request">' +
-					'<div><strong>' + escapeHtml(request.title || request.action || 'Pending action') + '</strong></div>' +
-					'<div class="ev-status-text">tool: ' + escapeHtml(request.action || '') + ' · risk: ' + escapeHtml(request.risk || 'medium') + '</div>' +
-					'<div style="margin-top:6px;">' + escapeHtml(request.message || '') + '</div>' +
-					(summaryMarkup ? '<div class="ev-approval-summary">' + summaryMarkup + '</div>' : '') +
-				'</div>';
-			});
-			el('approval-requests').innerHTML = markup;
-			el('approval-panel').classList.toggle('visible', currentResumeHandle !== '' && requests.length > 0);
-		}
 		function handleApplyResult(result) {
 			if (!result.ok) {
+				currentChangeId = '';
+				button('apply').disabled = true;
 				message('apply-message', result.message || 'Evolution apply failed.', 'error');
 				if (result.validation) el('diff').textContent = JSON.stringify(result.validation, null, 2);
 				el('result-panel').classList.add('visible');
 				return false;
 			}
-			if (result.status === 'awaiting_approval') {
-				renderApproval(result);
-				message('apply-message', result.message || 'MissionBay approval is required before the pending mutation may run.', 'error');
-				button('apply').disabled = true;
-				return false;
-			}
-			clearApproval();
 			el('diff').textContent = result.diff || (result.changed_paths || []).join('\n');
 			el('result-panel').classList.add('visible');
 			message('result-message', result.message || 'Evolution change applied.', 'ok');
@@ -262,7 +224,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			apply.className = 'ev-pill ' + (health.apply_ready ? 'ok' : 'error');
 			apply.textContent = 'Apply ' + (health.apply_ready ? 'ready' : 'blocked');
 			button('analyze').disabled = !health.analysis_ready;
-			button('apply').disabled = !(health.apply_ready && currentChangeId && !currentResumeHandle);
+			button('apply').disabled = !(health.apply_ready && currentChangeId);
 		}
 		async function call(action, data) {
 			var response = await fetch(actionUrl, {
@@ -316,24 +278,30 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			var btn = this;
 			message('request-message', '', '');
 			message('apply-message', '', '');
-			clearApproval();
 			setBusy(btn, true, 'Analyzing...');
 			try {
 				var result = await call('analyze', {prompt: prompt});
 				if (!result.ok) throw new Error(result.message || 'Evolution analysis failed.');
-				currentChangeId = result.change_id || '';
+				var applicable = result.applicable !== false;
+				currentChangeId = applicable ? (result.change_id || '') : '';
 				el('plan').textContent = result.plan || '';
 				el('change-id').textContent = currentChangeId ? 'change: ' + currentChangeId : '';
 				el('base-head').textContent = result.base_head ? 'base: ' + result.base_head : '';
 				el('plan-panel').classList.add('visible');
-				button('apply').disabled = !(health.apply_ready && currentChangeId && !currentResumeHandle);
-				message('request-message', 'Read-only analysis completed. Review the proposed change before Apply.', 'ok');
+				button('apply').disabled = !(applicable && health.apply_ready && currentChangeId);
+				message(
+					'request-message',
+					applicable
+						? 'Read-only analysis completed. Review the proposed change before Apply.'
+						: 'Read-only analysis found a blocker. Apply is disabled until a new applicable analysis succeeds.',
+					applicable ? 'ok' : 'error'
+				);
 			} catch (e) { message('request-message', e.message, 'error'); }
 			finally { setBusy(btn, false, 'Analyze change'); button('analyze').disabled = !health.analysis_ready; }
 		});
 
 		button('apply').addEventListener('click', async function() {
-			if (!currentChangeId || currentResumeHandle) return;
+			if (!currentChangeId) return;
 			var btn = this;
 			var completed = false;
 			message('apply-message', '', '');
@@ -344,28 +312,10 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			} catch (e) { message('apply-message', e.message, 'error'); }
 			finally {
 				btn.textContent = btn.dataset.label || 'Apply approved plan';
-				btn.disabled = completed || !!currentResumeHandle || !(health.apply_ready && currentChangeId);
+				btn.disabled = completed || !(health.apply_ready && currentChangeId);
 			}
 		});
 
-		button('approve-pending').addEventListener('click', async function() {
-			if (!currentChangeId || !currentResumeHandle) return;
-			var btn = this;
-			var completed = false;
-			message('apply-message', '', '');
-			setBusy(btn, true, 'Approving...');
-			try {
-				var result = await call('approve_apply', {
-					change_id: currentChangeId,
-					resume_handle: currentResumeHandle
-				});
-				completed = handleApplyResult(result);
-			} catch (e) { message('apply-message', e.message, 'error'); }
-			finally {
-				btn.textContent = btn.dataset.label || 'Approve pending action(s)';
-				btn.disabled = completed || !currentResumeHandle;
-			}
-		});
 
 		renderHealth(health);
 	})();
