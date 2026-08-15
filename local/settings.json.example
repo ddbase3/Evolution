@@ -100,8 +100,8 @@
             "mode": "governed",
             "max_tool_loops": 32,
             "model_decision": {
-                "strategy": "native-model-decision",
-                "repair_enabled": false,
+                "strategy": "ai-guarded-model-decision",
+                "repair_enabled": true,
                 "confidence_threshold": 0.7
             },
             "optional_stages": {
@@ -109,7 +109,7 @@
                 "capability-selection": true,
                 "ai-capability-selection": false,
                 "context-compaction": true,
-                "semantic-verification": false
+                "semantic-verification": true
             },
             "deliberate_planning": true,
             "capability_selection": {

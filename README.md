@@ -14,7 +14,7 @@ Open the UI through the normal BASE3 output route:
 
 `?name=evolutiondisplay&out=html`
 
-Analysis and Apply use one persistent MissionBay run. The agent reads the application and submits exactly one complete `evolution_apply_plan` tool call. Because that tool requires MissionBay approval, execution suspends before any source mutation. The UI renders the stored plan. `Apply approved plan` resumes that same MissionBay run and authorizes exactly the stored operation set; no second model decision is used to translate the plan into writes.
+Analysis and Apply use one persistent MissionBay run. Evolution activates its run-local `evolutionplanningmodule`, which mounts a planning guard into MissionBay before action policy. The agent reads the application and must either submit a complete `evolution_apply_plan` tool call or report an exact blocker through the read-only `evolution_report_blocker` tool. Evolution validates that pending plan before it is shown to the user. Invalid proposals such as no-op writes are rejected back into the same MissionBay run as a concrete tool observation so the agent can correct the plan without starting a second analysis. Once a valid plan is pending, the UI renders its exact stored operations. `Apply approved plan` resumes that same MissionBay run and authorizes exactly that operation set; no second model decision is used to translate the plan into writes.
 
 ## Configuration
 
@@ -36,7 +36,7 @@ MissionBay settings stay in `ISettingsStore`, normally:
 
 `<directories.data>/cnf/settings.json`
 
-The bundled settings examples provide the `evolution` agent, `evolution-workspace` tool preset and a dedicated governed orchestrator profile with 32 tool loops, native model decision, MissionBay context compaction and deliberate planning. Deliberate planning adds no extra planning model call; it instructs the existing orchestrator to use focused evidence calls and stop when the task is supported.
+The bundled settings examples provide the `evolution` agent, `evolution-workspace` tool preset and a dedicated governed orchestrator profile with 32 tool loops, `ai-guarded-model-decision`, MissionBay context compaction, semantic verification and deliberate planning. Deliberate planning adds no extra planning model call; it instructs the existing orchestrator to use focused evidence calls and stop when the task is supported.
 
 ## EvolutionWorkspace repository
 
@@ -71,7 +71,7 @@ The agent is instructed to start with `plugin/EvolutionWorkspace`, search before
 
 MissionBay `context-compaction` remains the only AI summarization mechanism in this path. In the governed profile it runs between tool execution and tool observation and summarizes individual successful tool results above MissionBay's configured threshold before they become model messages. Evolution does not maintain a second summarized context. Focused source reads are still important because compaction itself uses the active model and therefore also consumes provider tokens.
 
-The source fingerprint still covers relevant application source so an approved plan is invalidated when its reference implementation changes between Analysis and Apply. Framework-dependent plans must inspect the exact current BASE3 contract before submitting `evolution_apply_plan`; discoverable ClassMap components are not container-registered merely for discovery. The plan contains the complete ordered mutation set and complete content for every write, so Apply is deterministic and does not ask the model to decide again whether or how to write the approved files.
+The source fingerprint still covers relevant application source so an approved plan is invalidated when its reference implementation changes between Analysis and Apply. The Evolution planning guard is a run-local MissionBay module stage: if model decision attempts to complete an implementable planning run without `evolution_apply_plan`, it returns the same run to model decision with a concrete continuation instruction. It does not start a second agent run. Exact blockers use `evolution_report_blocker` and therefore terminate through an explicit structured outcome rather than free text. Framework-dependent plans must inspect the exact current BASE3 contract before submitting `evolution_apply_plan`; discoverable ClassMap components are not container-registered merely for discovery. Before user approval, Evolution validates the pending operation set against the current workspace, including no-op writes, duplicate target paths and the writable boundary. A rejected proposal is returned to the same MissionBay run for correction. The accepted plan contains the complete ordered mutation set and complete content for every write, so Apply is deterministic and does not ask the model to decide again whether or how to write the approved files.
 
 ## OpenAI baseline
 

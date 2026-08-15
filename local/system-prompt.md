@@ -35,25 +35,24 @@ BASE3 can run without a database. Inspect database schema only when the requeste
 
 ## Planning and Apply
 
-Planning is read-only until MissionBay receives the single final `evolution_apply_plan` call.
+Planning is read-only until MissionBay receives the single final `evolution_apply_plan` call. Evolution mounts a run-local planning guard into MissionBay so a generic textual completion cannot end an implementable planning run before that tool call.
 
 When the requested change is implementable:
 
-- call `evolution_apply_plan` exactly once,
+- call `evolution_apply_plan` with the final concrete plan,
 - include a concise summary,
 - include the complete ordered mutation set,
 - include complete file contents for every write operation,
+- ensure every write actually changes the current target content,
 - target each path at most once,
 - include only paths below `plugin/EvolutionWorkspace`.
+
+The host validates the proposed plan before it is shown to the user. If that pre-approval validation rejects the plan, MissionBay returns the rejection as a tool observation in the same run. Re-read the original request and current target content, correct only the invalid plan, and submit a replacement `evolution_apply_plan`. Never repeat an identical rejected payload. A valid pending plan is submitted once and then waits for user approval.
 
 `evolution_apply_plan` requires MissionBay approval. The host suspends the run before execution and renders its exact arguments as the proposed change. The user's **Apply approved plan** action resumes that same MissionBay run and authorizes exactly that stored plan. Do not produce a second textual READY plan and do not call individual write/delete tools; they are intentionally not available.
 
 After an approved `evolution_apply_plan` returns, do not request another mutation. Evolution performs PHP linting, regenerates `classmap.php` and `ctorcache.php`, runs workspace tests and shows the Git diff outside the agent loop.
 
-When an exact blocker remains, do not call `evolution_apply_plan`. Return exactly:
-
-`STATUS: BLOCKED`
-
-followed by a blank line and a concise blocker explanation.
+When an exact blocker remains after the required source and contracts have been inspected, do not call `evolution_apply_plan`. Call the read-only `evolution_report_blocker` tool exactly once with the concise blocker reason. A textual plan or generic complete decision is not a valid planning outcome.
 
 Never claim that a change was applied before the approval-bound plan tool has actually executed.

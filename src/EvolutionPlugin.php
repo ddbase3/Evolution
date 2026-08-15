@@ -2,10 +2,12 @@
 
 namespace Evolution;
 
+use AssistantFoundation\Api\IAgentModule;
 use Base3\Api\IClassMap;
 use Base3\Api\IContainer;
 use Base3\Api\IPlugin;
 use Base3\Configuration\Api\IConfiguration;
+use Base3\Core\ComponentDefinition;
 use Evolution\Service\EvolutionAgentService;
 use Evolution\Service\EvolutionConfiguration;
 use Evolution\Service\EvolutionDatabaseInspector;
@@ -23,7 +25,14 @@ final class EvolutionPlugin implements IPlugin {
 	}
 
 	public function init() {
+		$planningModule = new ComponentDefinition(
+			id: EvolutionConfiguration::PLANNING_MODULE_COMPONENT,
+			interfaceName: IAgentModule::class,
+			implementationName: EvolutionConfiguration::PLANNING_MODULE_IMPLEMENTATION
+		);
+
 		$this->container
+			->set($planningModule->getServiceName(), $planningModule, IContainer::PARAMETER)
 			->set(self::getName(), $this, IContainer::SHARED)
 			->set(EvolutionConfiguration::class, fn($c) => new EvolutionConfiguration(
 				$c->get(IConfiguration::class)

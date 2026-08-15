@@ -2,10 +2,12 @@
 
 namespace Evolution\Service;
 
+use AssistantFoundation\Api\IAgentModule;
 use AssistantFoundation\Api\IAgentSuspensionRepository;
 use AssistantFoundation\Api\IAiChatModel;
 use Base3\Accesscontrol\Api\IAccesscontrol;
 use Base3\Api\IClassMap;
+use Base3\Api\IComponentResolver;
 use Base3\Api\IContainer;
 use Base3\Database\Api\IDatabase;
 use Base3\Logger\Api\ILogger;
@@ -245,12 +247,16 @@ final class EvolutionHealthService {
 					throw new RuntimeException('Evolution workspace resource does not implement IAgentTool.');
 				}
 				$mutationTools = [];
+				$toolNames = [];
 				foreach ($tool->getToolDefinitions() as $definition) {
 					if (!is_array($definition)) {
 						throw new RuntimeException('Evolution workspace tool returned an invalid function definition.');
 					}
 					$function = is_array($definition['function'] ?? null) ? $definition['function'] : [];
 					$name = trim((string)($function['name'] ?? ''));
+					if ($name !== '') {
+						$toolNames[] = $name;
+					}
 					$parameters = $function['parameters'] ?? null;
 					if (!is_array($parameters) || ($parameters['type'] ?? null) !== 'object') {
 						throw new RuntimeException('Evolution tool has no object parameter schema: ' . ($name !== '' ? $name : '(unnamed)'));
@@ -268,6 +274,28 @@ final class EvolutionHealthService {
 				if ($mutationTools !== ['evolution_apply_plan']) {
 					throw new RuntimeException('Evolution must expose exactly one approval-bound mutation tool: evolution_apply_plan. Found: ' . implode(', ', $mutationTools));
 				}
+				if (!in_array('evolution_report_blocker', $toolNames, true)) {
+					throw new RuntimeException('Evolution workspace resource must expose the read-only evolution_report_blocker planning outcome tool.');
+				}
+				$planningModuleClass = $classMap->getClassByInterfaceName(
+					IAgentModule::class,
+					EvolutionConfiguration::PLANNING_MODULE_IMPLEMENTATION
+				);
+				if (!is_string($planningModuleClass) || $planningModuleClass === '') {
+					throw new RuntimeException('Evolution planning guard implementation is not discoverable: ' . EvolutionConfiguration::PLANNING_MODULE_IMPLEMENTATION);
+				}
+				$componentResolver = $this->requireService(
+					IComponentResolver::class,
+					IComponentResolver::class,
+					'IComponentResolver is not available.'
+				);
+				$planningModule = $componentResolver->get(
+					IAgentModule::class,
+					EvolutionConfiguration::PLANNING_MODULE_COMPONENT
+				);
+				if (!$planningModule instanceof IAgentModule) {
+					throw new RuntimeException('Evolution planning guard configured component does not resolve: ' . EvolutionConfiguration::PLANNING_MODULE_COMPONENT);
+				}
 
 				$orchestratorProfileId = strtolower(trim((string)($agent['orchestrator_profile'] ?? AgentOrchestratorProfileRepository::DEFAULT_PROFILE_ID)));
 				$profileRepository = $this->requireService(
@@ -282,17 +310,17 @@ final class EvolutionHealthService {
 				$contextCompaction = in_array('context-compaction', $stageIds, true);
 				$deliberatePlanning = $orchestratorProfile->isDeliberatePlanningEnabled();
 				$lowLoopLimit = $maxToolLoops < 16;
-				$nativeDecision = $modelDecisionStrategy === AgentModelDecisionConfig::STRATEGY_NATIVE;
+				$guardedDecision = $modelDecisionStrategy === AgentModelDecisionConfig::STRATEGY_AI_GUARDED;
 
-				$message = 'Agent, chat model preset, Evolution tool profile, single approval-bound apply-plan tool and orchestrator profile are configured.';
+				$message = 'Agent, chat model preset, Evolution tool profile, planning guard module, single approval-bound apply-plan tool and orchestrator profile are configured.';
 				$status = 'ok';
 				if ($lowLoopLimit) {
 					$status = 'warning';
 					$message = 'Agent configuration is valid, but orchestrator profile "' . $orchestratorProfileId . '" allows only ' . $maxToolLoops . ' tool loops. Evolution recommends at least 16 loops; the bundled profile uses 32.';
 				}
-				elseif (!$nativeDecision) {
+				elseif (!$guardedDecision) {
 					$status = 'warning';
-					$message = 'Agent configuration is valid, but Evolution recommends MissionBay native-model-decision so the terminal tool-loop response is reused directly.';
+					$message = 'Agent configuration is valid, but Evolution recommends MissionBay ai-guarded-model-decision together with the Evolution planning guard module.';
 				}
 				elseif (!$contextCompaction) {
 					$status = 'warning';
@@ -311,6 +339,8 @@ final class EvolutionHealthService {
 						'model_decision' => $modelDecisionStrategy,
 						'deliberate_planning' => $deliberatePlanning,
 						'context_compaction' => $contextCompaction,
+						'planning_guard_component' => EvolutionConfiguration::PLANNING_MODULE_COMPONENT,
+						'planning_guard_implementation' => EvolutionConfiguration::PLANNING_MODULE_IMPLEMENTATION,
 						'stage_ids' => $stageIds
 					]
 				];
@@ -365,7 +395,7 @@ final class EvolutionHealthService {
 		if ($agent !== []) {
 			$this->runCheck($checks, 'agent_compile', 'Agent compilation', function() use ($agent): array {
 				$compiler = $this->requireService(IAgentFlowCompiler::class, IAgentFlowCompiler::class, 'MissionBay IAgentFlowCompiler is not available.');
-				$compilation = $compiler->compile($agent);
+				$compilation = $compiler->compile($this->configuration->prepareAgentSettings($agent));
 				return [
 					'message' => 'MissionBay agent flow compiles successfully.',
 					'details' => ['warnings' => $compilation->getWarnings()]

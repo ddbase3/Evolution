@@ -51,6 +51,9 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'table' => ['type' => 'string', 'description' => 'Optional exact table name. Empty lists all tables.']
 			]),
 			$this->readDefinition('evolution_git_diff', 'EvolutionWorkspace Git Diff', 'Returns the current Git diff and untracked file list for plugin/EvolutionWorkspace only.', []),
+			$this->readDefinition('evolution_report_blocker', 'Report Evolution Planning Blocker', 'Reports an exact blocker that prevents a safe EvolutionWorkspace implementation. Use only when the requested change cannot be implemented safely after inspecting the required source and contracts.', [
+				'reason' => ['type' => 'string', 'minLength' => 1, 'description' => 'Concise exact blocker reason.']
+			], ['reason']),
 			$this->mutationDefinition(
 				'evolution_apply_plan',
 				'Apply EvolutionWorkspace Plan',
@@ -123,6 +126,7 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 					isset($arguments['table']) ? (string)$arguments['table'] : null
 				),
 				'evolution_git_diff' => ['diff' => $this->workspace->getGitDiff()],
+				'evolution_report_blocker' => $this->reportBlocker((string)($arguments['reason'] ?? '')),
 				'evolution_apply_plan' => $this->workspace->applyPlan(
 					is_array($arguments['operations'] ?? null) ? $arguments['operations'] : []
 				),
@@ -146,7 +150,22 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 			'evolution_search_source' => ['type' => 'array'],
 			'evolution_database_schema' => $schema,
 			'evolution_git_diff' => $schema,
+			'evolution_report_blocker' => $schema,
 			'evolution_apply_plan' => $schema
+		];
+	}
+
+
+	/** @return array{ok:bool,blocked:bool,reason:string} */
+	private function reportBlocker(string $reason): array {
+		$reason = trim($reason);
+		if ($reason === '') {
+			throw new InvalidArgumentException('Evolution blocker reason must not be empty.');
+		}
+		return [
+			'ok' => true,
+			'blocked' => true,
+			'reason' => $reason
 		];
 	}
 

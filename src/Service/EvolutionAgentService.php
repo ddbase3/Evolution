@@ -13,6 +13,7 @@ use Base3\Api\IContainer;
 use Base3\Settings\Api\ISettingsStore;
 use Base3\State\Api\IStateStore;
 use MissionBay\Service\AgentExecutionService;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -21,7 +22,7 @@ final class EvolutionAgentService {
 	private const CHANGE_KEY_PREFIX = 'evolution.change.';
 	private const APPLY_LOCK_KEY = 'locks.evolution.apply';
 	private const CHANGE_TTL_SECONDS = 86400;
-	private const CHANGE_FORMAT_VERSION = 5;
+	private const CHANGE_FORMAT_VERSION = 6;
 	private const APPLY_LOCK_TTL_SECONDS = 1800;
 	private const APPLY_PLAN_TOOL = 'evolution_apply_plan';
 
@@ -46,36 +47,47 @@ final class EvolutionAgentService {
 
 		$baseSourceFingerprint = $this->workspace->createSourceFingerprint();
 		$baseHead = $this->configuration->isGitRequired() ? $this->workspace->getGitHead() : '';
+		$context = [
+			'evolution_mode' => 'plan',
+			'evolution_workspace' => $this->configuration->getWorkspace(),
+			'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
+		];
 		$result = $this->executeAgent(
 			'analyze',
 			$this->buildAnalyzeInstruction($prompt),
-			[
-				'evolution_mode' => 'plan',
-				'evolution_workspace' => $this->configuration->getWorkspace(),
-				'evolution_write_root' => $this->configuration->getWorkspacePluginPath()
-			]
+			$context
 		);
 
-		if ($result->getAgentResult()?->isSuspended()) {
-			return $this->storePlannedChange(
-				$this->requireStateStore(),
-				$prompt,
-				$baseHead,
-				$baseSourceFingerprint,
-				$result
-			);
-		}
+		while (true) {
+			if ($result->getAgentResult()?->isSuspended()) {
+				try {
+					return $this->storePlannedChange(
+						$this->requireStateStore(),
+						$prompt,
+						$baseHead,
+						$baseSourceFingerprint,
+						$result
+					);
+				} catch (InvalidArgumentException $e) {
+					$result = $this->resumeRejectedPlan($result, $context, $e->getMessage());
+					continue;
+				}
+			}
 
-		$this->assertSuccessfulAgentResult($result, 'analysis');
-		$blocker = $this->parseBlockedAnalysis($this->extractAssistantText($result));
-		return [
-			'ok' => true,
-			'applicable' => false,
-			'change_id' => '',
-			'plan' => $blocker,
-			'base_head' => $baseHead,
-			'warnings' => $result->getWarnings()
-		];
+			$this->assertSuccessfulAgentResult($result, 'analysis');
+			$blocker = $this->findReportedBlocker($result);
+			if ($blocker === null) {
+				$blocker = $this->parseBlockedAnalysis($this->extractAssistantText($result));
+			}
+			return [
+				'ok' => true,
+				'applicable' => false,
+				'change_id' => '',
+				'plan' => $blocker,
+				'base_head' => $baseHead,
+				'warnings' => $result->getWarnings()
+			];
+		}
 	}
 
 	/** @return array<string,mixed> */
@@ -222,6 +234,7 @@ final class EvolutionAgentService {
 		if ($agentSettings === []) {
 			throw new RuntimeException('Evolution agent settings not found: agent/' . $agentId);
 		}
+		$agentSettings = $this->configuration->prepareAgentSettings($agentSettings);
 
 		$systemPrompt = $this->loadSystemPrompt();
 		$storedSystemPrompt = trim((string)($agentSettings['system_prompt'] ?? ''));
@@ -247,15 +260,52 @@ final class EvolutionAgentService {
 		return $executionService->execute($request);
 	}
 
+	/** @param array<string,mixed> $context */
+	private function resumeRejectedPlan(AgentExecutionResult $result, array $context, string $reason): AgentExecutionResult {
+		$agentResult = $result->getAgentResult();
+		$suspension = $agentResult?->getState()->getSuspension();
+		if ($agentResult === null || !$agentResult->isSuspended() || $suspension === null || !$suspension->isSuspended()) {
+			throw new RuntimeException('Cannot return an invalid Evolution plan to MissionBay because no active suspension is available.');
+		}
+
+		$requests = $suspension->getInteractionRequests();
+		if (count($requests) !== 1 || !$requests[0] instanceof AgentInteractionRequest) {
+			throw new RuntimeException('Invalid Evolution plan recovery requires exactly one pending MissionBay interaction.');
+		}
+		$request = $requests[0];
+		if (!$this->isApplyPlanToolName($request->getAction()->getName())) {
+			throw new RuntimeException('Invalid Evolution plan recovery received an unexpected pending action: ' . $request->getAction()->getName());
+		}
+
+		$resumeHandle = trim($suspension->getResumeHandle());
+		if ($resumeHandle === '') {
+			throw new RuntimeException('Invalid Evolution plan recovery has no MissionBay resume handle.');
+		}
+
+		$note = 'Evolution rejected this proposed plan before user approval because plan validation failed: ' . trim($reason)
+			. ' Re-read the original requested change and the current target content, correct the plan, and submit a replacement evolution_apply_plan. Do not repeat the rejected payload.';
+		$resume = new AgentResume($resumeHandle, [
+			new AgentInteractionResponse(
+				$request->getId(),
+				AgentInteractionResponse::DECISION_DENY,
+				[],
+				$note,
+				['source' => 'evolution_plan_validation']
+			)
+		]);
+
+		return $this->executeAgent('analyze', '', $context, $resume);
+	}
+
 	private function buildAnalyzeInstruction(string $prompt): string {
 		return "Analyze this requested change for plugin/EvolutionWorkspace without executing source mutations:\n\n"
 			. $prompt
 			. "\n\nStart with plugin/EvolutionWorkspace. Search before listing broad trees and read only the files needed to understand the requested change. "
 			. "BASE3 framework source lives below the application src/ tree; never invent vendor paths. For every BASE3 interface, abstract class or framework API that the implementation depends on, search the current application source and inspect its exact signature before proposing code. Do not infer missing methods, parameters, return types or registration requirements. "
 			. "ClassMap-discoverable components do not need container registration solely for discovery. Modify plugin init() only when the inspected implementation proves actual service composition is required. "
-			. "When the change is fully understood and implementable, do NOT return a textual READY plan. Instead call evolution_apply_plan exactly once with the complete final mutation set. Every write operation must contain the complete target file content. Every target path may occur only once. That tool is approval-bound: MissionBay will suspend before executing it, and the host will render its exact arguments as the proposed plan. "
-			. "If an exact blocker remains, do not call evolution_apply_plan. Return exactly STATUS: BLOCKED, a blank line, and the concise blocker explanation. "
-			. "Do not call evolution_apply_plan merely to test it. Once the tool call is emitted, analysis is complete.";
+			. "When the change is fully understood and implementable, do NOT return a textual READY plan. Instead call evolution_apply_plan with the complete final mutation set. Every write operation must contain the complete target file content and must actually differ from the current target content. Every target path may occur only once. That tool is approval-bound: MissionBay will suspend before executing it, and the host will validate its exact arguments before showing the proposed plan. If host validation rejects the proposal before user approval, use the returned rejection reason to correct the plan and submit one replacement evolution_apply_plan; never repeat the rejected payload. "
+			. "If an exact blocker remains after inspecting the required source and contracts, call evolution_report_blocker with the concise blocker reason instead of returning a textual plan. "
+			. "Do not call evolution_apply_plan merely to test it. A generic textual completion is not a valid Evolution planning result. Once a valid apply-plan tool call is accepted for user approval, analysis is complete.";
 	}
 
 	/** @return array<string,mixed> */
@@ -329,6 +379,33 @@ final class EvolutionAgentService {
 			'operation_count' => count($operations),
 			'warnings' => $result->getWarnings()
 		];
+	}
+
+
+	private function findReportedBlocker(AgentExecutionResult $result): ?string {
+		$execution = $result->getAgentResult()?->getState()->getExecution();
+		$calls = $execution?->getExecutedToolCalls() ?? [];
+		foreach (array_reverse($calls) as $entry) {
+			if (!is_array($entry)) {
+				continue;
+			}
+			$name = trim((string)($entry['tool'] ?? ''));
+			if ($name !== 'evolution_report_blocker' && !str_ends_with($name, '__evolution_report_blocker')) {
+				continue;
+			}
+			if (isset($entry['error'])) {
+				continue;
+			}
+			$toolResult = is_array($entry['result'] ?? null) ? $entry['result'] : [];
+			if (($toolResult['ok'] ?? false) !== true || ($toolResult['blocked'] ?? false) !== true) {
+				continue;
+			}
+			$reason = trim((string)($toolResult['reason'] ?? ''));
+			if ($reason !== '') {
+				return $reason;
+			}
+		}
+		return null;
 	}
 
 	private function parseBlockedAnalysis(string $text): string {

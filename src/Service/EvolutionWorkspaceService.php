@@ -4,6 +4,7 @@ namespace Evolution\Service;
 
 use Base3\Api\IClassMap;
 use FilesystemIterator;
+use InvalidArgumentException;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
 use RuntimeException;
@@ -298,7 +299,11 @@ final class EvolutionWorkspaceService {
 
 	/** @param array<int,mixed> $operations @return array<int,array<string,mixed>> */
 	public function validatePlanOperations(array $operations): array {
-		return $this->normalizePlanOperations($operations);
+		try {
+			return $this->normalizePlanOperations($operations);
+		} catch (RuntimeException $e) {
+			throw new InvalidArgumentException($e->getMessage(), 0, $e);
+		}
 	}
 
 	/** @param array<int,mixed> $operations @return array<string,mixed> */
