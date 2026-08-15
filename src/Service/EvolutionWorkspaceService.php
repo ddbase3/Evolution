@@ -72,6 +72,10 @@ final class EvolutionWorkspaceService {
 	}
 
 	public function readFile(string $relativePath, int $maxBytes = self::MAX_READ_BYTES): string {
+		$relative = $this->normalizeRelativePath($relativePath);
+		if ($this->isIgnoredPath($relative)) {
+			throw new RuntimeException('Path is not readable through the Evolution source tool: ' . $relativePath);
+		}
 		$path = $this->resolveExistingPath($relativePath, false);
 		if (!is_file($path)) {
 			throw new RuntimeException('Path is not a file: ' . $relativePath);
@@ -102,6 +106,10 @@ final class EvolutionWorkspaceService {
 			throw new RuntimeException('Search query must not be empty.');
 		}
 
+		$relative = $this->normalizeRelativePath($relativePath);
+		if ($relative !== '' && $this->isIgnoredPath($relative)) {
+			throw new RuntimeException('Path is not searchable through the Evolution source tool: ' . $relativePath);
+		}
 		$path = $this->resolveExistingPath($relativePath, true);
 		$maxResults = max(1, min(250, $maxResults));
 		$files = [];
@@ -300,6 +308,65 @@ final class EvolutionWorkspaceService {
 	public function isGitClean(): bool {
 		$status = $this->getGitStatus();
 		return ($status['available'] ?? false) === true && ($status['clean'] ?? false) === true;
+	}
+
+	public function createSourceFingerprint(): string {
+		$workspace = $this->requireWorkspace();
+		$files = [];
+
+		foreach (['src', 'plugin'] as $relativeRoot) {
+			$root = $workspace . DIRECTORY_SEPARATOR . $relativeRoot;
+			if (!is_dir($root)) {
+				continue;
+			}
+
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+			);
+			foreach ($iterator as $item) {
+				if (!$item->isFile() || $item->isLink()) {
+					continue;
+				}
+				$relative = $this->relativePath($item->getPathname());
+				if ($this->isIgnoredPath($relative)) {
+					continue;
+				}
+				$hash = hash_file('sha256', $item->getPathname());
+				if (!is_string($hash)) {
+					throw new RuntimeException('Unable to fingerprint source file: ' . $relative);
+				}
+				$files[$relative] = $hash;
+			}
+		}
+
+		$configFile = $workspace . DIRECTORY_SEPARATOR . 'cnf' . DIRECTORY_SEPARATOR . 'config.ini';
+		if (is_file($configFile)) {
+			$hash = hash_file('sha256', $configFile);
+			if (!is_string($hash)) {
+				throw new RuntimeException('Unable to fingerprint configuration file: cnf/config.ini');
+			}
+			$files['cnf/config.ini'] = $hash;
+		}
+
+		ksort($files);
+		$payload = '';
+		foreach ($files as $relative => $hash) {
+			$payload .= $relative . "\0" . $hash . "\n";
+		}
+
+		return hash('sha256', $payload);
+	}
+
+	public function assertSourceFingerprint(string $expectedFingerprint): void {
+		$expectedFingerprint = trim($expectedFingerprint);
+		if ($expectedFingerprint === '') {
+			throw new RuntimeException('Approved change has no source fingerprint. Re-run analysis.');
+		}
+
+		$currentFingerprint = $this->createSourceFingerprint();
+		if (!hash_equals($expectedFingerprint, $currentFingerprint)) {
+			throw new RuntimeException('Application source changed since analysis. Re-run analysis before Apply.');
+		}
 	}
 
 	/** @return array<string,mixed> */
@@ -675,8 +742,12 @@ final class EvolutionWorkspaceService {
 
 	private function isIgnoredPath(string $relativePath): bool {
 		$relativePath = str_replace('\\', '/', ltrim($relativePath, '/'));
-		foreach (['.git/', 'vendor/', 'tmp/', 'userfiles/', 'local/FileLogger/'] as $prefix) {
-			if (str_starts_with($relativePath, $prefix)) {
+		$segments = explode('/', trim($relativePath, '/'));
+		if (in_array('.git', $segments, true)) {
+			return true;
+		}
+		foreach (['vendor', 'tmp', 'userfiles', 'local/FileLogger', 'local/secret'] as $prefix) {
+			if ($relativePath === $prefix || str_starts_with($relativePath, $prefix . '/')) {
 				return true;
 			}
 		}

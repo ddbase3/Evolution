@@ -2,6 +2,7 @@
 
 namespace Evolution\Service;
 
+use AssistantFoundation\Api\IAgentSuspensionRepository;
 use AssistantFoundation\Api\IAiChatModel;
 use Base3\Accesscontrol\Api\IAccesscontrol;
 use Base3\Api\IClassMap;
@@ -13,6 +14,9 @@ use Base3\State\Api\IStateStore;
 use Base3\Usermanager\Api\IUsermanager;
 use MissionBay\Api\IAgentFlowCompiler;
 use MissionBay\Api\IAgentResource;
+use MissionBay\Api\IAgentTool;
+use MissionBay\Dto\Orchestrator\AgentModelDecisionConfig;
+use MissionBay\Orchestrator\Profile\AgentOrchestratorProfileRepository;
 use MissionBay\Service\ConfiguredServiceRuntimeResolver;
 use RuntimeException;
 use Throwable;
@@ -23,6 +27,7 @@ final class EvolutionHealthService {
 	private const PRESET_GROUP = 'agent-component-preset';
 	private const TOOL_PROFILE_GROUP = 'tool-profile';
 	private const LLM_GROUP = 'service-llm';
+	private const CONNECTION_GROUP = 'connection';
 
 	public function __construct(
 		private readonly EvolutionConfiguration $configuration,
@@ -120,7 +125,7 @@ final class EvolutionHealthService {
 					'repositories' => array_keys($repositories)
 				]
 			];
-		}, $analysisReady, $applyReady, $this->configuration->isGitRequired(), $this->configuration->isGitRequired());
+		}, $analysisReady, $applyReady, false, $this->configuration->isGitRequired());
 
 		if ($this->configuration->isGitRequired()) {
 			$gitStatus = $checks['git']['details']['clean'] ?? null;
@@ -132,24 +137,40 @@ final class EvolutionHealthService {
 		$this->runCheck($checks, 'settings_path', 'Settings path', function(): array {
 			$data = $this->configuration->getDataDirectory();
 			if ($data === '') {
-				throw new RuntimeException('Missing [directories] data in cnf/config.ini. Configure a writable data directory, normally <workspace>/local. JsonSettingsStore stores settings at <data>/cnf/settings.json. See plugin/Evolution/local/config.ini.example.');
+				throw new RuntimeException('Missing [directories] data in cnf/config.ini. Configure the data directory, normally <workspace>/local. JsonSettingsStore reads settings from <data>/cnf/settings.json. See plugin/Evolution/local/config.ini.example.');
 			}
 			$dataReal = realpath($data);
 			if (!is_string($dataReal) || !is_dir($dataReal)) {
 				throw new RuntimeException('Configured [directories] data directory does not exist: ' . $data);
 			}
+
 			$cnf = $dataReal . DIRECTORY_SEPARATOR . 'cnf';
+			$file = $cnf . DIRECTORY_SEPARATOR . 'settings.json';
+			if (is_file($file) && !is_readable($file)) {
+				throw new RuntimeException('Settings file exists but is not readable by the PHP process: ' . $file);
+			}
+
 			if (is_dir($cnf) && !is_writable($cnf)) {
-				throw new RuntimeException('Settings directory is not writable: ' . $cnf);
+				return [
+					'status' => 'warning',
+					'message' => 'Settings directory is read-only for the PHP process. Existing settings can be used, but settings cannot be persisted from the runtime: ' . $cnf,
+					'details' => ['file' => $file]
+				];
 			}
+
 			if (!is_dir($cnf) && !is_writable($dataReal)) {
-				throw new RuntimeException('Data directory is not writable, so JsonSettingsStore cannot create cnf/: ' . $dataReal);
+				return [
+					'status' => 'warning',
+					'message' => 'Settings directory does not exist and cannot be created by the PHP process. Create it manually before runtime settings need to be persisted: ' . $cnf,
+					'details' => ['file' => $file]
+				];
 			}
+
 			return [
 				'message' => 'Settings storage path is available.',
-				'details' => ['file' => $cnf . DIRECTORY_SEPARATOR . 'settings.json']
+				'details' => ['file' => $file]
 			];
-		}, $analysisReady, $applyReady, true, true);
+		}, $analysisReady, $applyReady, true, false);
 
 		$settings = null;
 		$this->runCheck($checks, 'settings_store', 'Settings store', function() use (&$settings): array {
@@ -211,9 +232,62 @@ final class EvolutionHealthService {
 				if (!is_string($toolClass) || $toolClass === '') {
 					throw new RuntimeException('Evolution workspace agent tool was not discovered by IClassMap. Regenerate the class map and verify plugin/Evolution/src.');
 				}
+				$tool = $classMap->getInstanceByInterfaceName(IAgentResource::class, 'evolutionworkspaceagenttool');
+				if (!$tool instanceof IAgentTool) {
+					throw new RuntimeException('Evolution workspace resource does not implement IAgentTool.');
+				}
+				foreach ($tool->getToolDefinitions() as $definition) {
+					if (!is_array($definition)) {
+						throw new RuntimeException('Evolution workspace tool returned an invalid function definition.');
+					}
+					$function = is_array($definition['function'] ?? null) ? $definition['function'] : [];
+					$name = trim((string)($function['name'] ?? ''));
+					$parameters = $function['parameters'] ?? null;
+					if (!is_array($parameters) || ($parameters['type'] ?? null) !== 'object') {
+						throw new RuntimeException('Evolution tool has no object parameter schema: ' . ($name !== '' ? $name : '(unnamed)'));
+					}
+					if (($parameters['properties'] ?? null) === []) {
+						throw new RuntimeException('Evolution tool has an OpenAI-incompatible empty properties array. Parameterless tools must serialize properties as an object: ' . $name);
+					}
+					if (($definition['mutation'] ?? false) === true && ($definition['requiresApproval'] ?? false) !== true) {
+						throw new RuntimeException('Evolution mutation tool does not require MissionBay approval and will not be exposed: ' . $name);
+					}
+				}
+
+				$orchestratorProfileId = strtolower(trim((string)($agent['orchestrator_profile'] ?? AgentOrchestratorProfileRepository::DEFAULT_PROFILE_ID)));
+				$profileRepository = $this->requireService(
+					AgentOrchestratorProfileRepository::class,
+					AgentOrchestratorProfileRepository::class,
+					'MissionBay AgentOrchestratorProfileRepository is not available.'
+				);
+				$orchestratorProfile = $profileRepository->getProfile($orchestratorProfileId);
+				$maxToolLoops = $orchestratorProfile->getMaxToolLoops();
+				$modelDecisionStrategy = $orchestratorProfile->getModelDecision()->getStrategy();
+				$lowLoopLimit = $maxToolLoops < 16;
+				$nativeDecision = $modelDecisionStrategy === AgentModelDecisionConfig::STRATEGY_NATIVE;
+
+				$message = 'Agent, chat model preset, Evolution tool profile and orchestrator profile are configured.';
+				$status = 'ok';
+				if ($lowLoopLimit) {
+					$status = 'warning';
+					$message = 'Agent configuration is valid, but orchestrator profile "' . $orchestratorProfileId . '" allows only ' . $maxToolLoops . ' tool loops. Evolution recommends a dedicated governed profile with at least 16 loops; the bundled profile uses 32.';
+				}
+				elseif (!$nativeDecision) {
+					$status = 'warning';
+					$message = 'Agent configuration is valid, but Evolution recommends MissionBay native-model-decision so the terminal tool-loop response is reused directly instead of requiring a separate final-response model call.';
+				}
+
 				return [
-					'message' => 'Agent, chat model preset and Evolution tool profile are configured.',
-					'details' => ['agent' => $agentId, 'chatmodel' => $chatPresetId, 'llm_service' => $llmServiceId]
+					'status' => $status,
+					'message' => $message,
+					'details' => [
+						'agent' => $agentId,
+						'chatmodel' => $chatPresetId,
+						'llm_service' => $llmServiceId,
+						'orchestrator_profile' => $orchestratorProfileId,
+						'max_tool_loops' => $maxToolLoops,
+						'model_decision' => $modelDecisionStrategy
+					]
 				];
 			}, $analysisReady, $applyReady, true, true);
 		}
@@ -224,6 +298,29 @@ final class EvolutionHealthService {
 				if ($serviceSettings === []) {
 					throw new RuntimeException('Configured LLM service not found: ' . self::LLM_GROUP . '/' . $llmServiceId);
 				}
+
+				$driver = strtolower(trim((string)($serviceSettings['driver'] ?? '')));
+				$modelName = trim((string)($serviceSettings['model'] ?? ''));
+				if ($modelName === '') {
+					throw new RuntimeException('Configured LLM service has no model: ' . self::LLM_GROUP . '/' . $llmServiceId . '. For the bundled OpenAI example use model "gpt-4.1".');
+				}
+
+				$connectionId = strtolower(trim((string)($serviceSettings['connection'] ?? '')));
+				if ($connectionId === '') {
+					throw new RuntimeException('Configured LLM service has no connection id: ' . self::LLM_GROUP . '/' . $llmServiceId);
+				}
+				$connectionSettings = $settings->get(self::CONNECTION_GROUP, $connectionId, []);
+				if ($connectionSettings === []) {
+					throw new RuntimeException('Configured LLM connection not found: ' . self::CONNECTION_GROUP . '/' . $connectionId);
+				}
+				$baseUrl = trim((string)($connectionSettings['baseUrl'] ?? ''));
+				if ($baseUrl === '') {
+					$suggestion = $driver === 'openai-chat'
+						? ' Set connection/' . $connectionId . '.baseUrl to "https://api.openai.com".'
+						: ' Set connection/' . $connectionId . '.baseUrl to the root URL of the OpenAI-compatible endpoint.';
+					throw new RuntimeException('Configured LLM connection has no base URL: ' . self::CONNECTION_GROUP . '/' . $connectionId . '.' . $suggestion);
+				}
+
 				$resolver = $this->requireService(
 					ConfiguredServiceRuntimeResolver::class,
 					ConfiguredServiceRuntimeResolver::class,
@@ -286,6 +383,16 @@ final class EvolutionHealthService {
 			}
 			return ['message' => 'IStateStore write/read/delete probe succeeded.'];
 		}, $analysisReady, $applyReady, true, true);
+
+		$this->runCheck($checks, 'agent_suspension', 'Agent approval persistence', function(): array {
+			$repository = $this->requireService(
+				IAgentSuspensionRepository::class,
+				IAgentSuspensionRepository::class,
+				'Wire IAgentSuspensionRepository to a persistent implementation. The installed AssistantRuntime StateStoreAgentSuspensionRepository can use the configured IStateStore.'
+			);
+			$repository->findPending('evolution-health-' . bin2hex(random_bytes(8)));
+			return ['message' => 'Persistent MissionBay approval suspension/resume storage is available.'];
+		}, $analysisReady, $applyReady, false, true);
 
 		$this->runCheck($checks, 'system_prompt', 'System prompt', function(): array {
 			$file = $this->configuration->getSystemPromptFile();

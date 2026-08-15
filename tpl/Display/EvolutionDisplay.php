@@ -66,6 +66,14 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-message.error { border-color:#edb5b5; background:#fff4f4; color:#7d2727; }
 		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-message.ok { border-color:#a8d7be; background:#f0faf4; color:#175f39; }
 		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-meta { display:flex; gap:14px; flex-wrap:wrap; color:var(--ev-muted); font-size:12px; margin-top:10px; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval { display:none; margin-bottom:14px; border:1px solid #e3c487; background:#fffaf0; border-radius:8px; padding:14px; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval.visible { display:block; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-title { font-weight:650; margin-bottom:8px; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-request { border-top:1px solid #ead8b3; padding-top:10px; margin-top:10px; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-request:first-child { border-top:0; padding-top:0; margin-top:0; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-summary { display:grid; grid-template-columns:minmax(120px,220px) 1fr; gap:5px 12px; margin-top:8px; font-size:13px; }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-key { color:var(--ev-muted); }
+		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-approval-value { white-space:pre-wrap; overflow-wrap:anywhere; }
 		#<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-spinner { display:inline-block; width:13px; height:13px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:evspin .8s linear infinite; vertical-align:-2px; margin-right:6px; }
 		@keyframes evspin { to { transform:rotate(360deg); } }
 		@media (max-width:760px) { #<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> { padding:14px; } #<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-header { flex-direction:column; } #<?php echo htmlspecialchars($containerId, ENT_QUOTES, 'UTF-8'); ?> .ev-ready { justify-content:flex-start; } }
@@ -91,6 +99,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 				</div>
 				<div class="ev-actions">
 					<button type="button" data-action="llm-test">Test LLM</button>
+					<button type="button" data-action="agent-test">Test agent loop</button>
 					<button type="button" data-action="health">Run checks</button>
 				</div>
 			</div>
@@ -136,6 +145,13 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			</div>
 			<div class="ev-panel-body">
 				<div class="ev-message" data-role="apply-message"></div>
+				<div class="ev-approval" data-role="approval-panel">
+					<div class="ev-approval-title">MissionBay approval required</div>
+					<div data-role="approval-requests"></div>
+					<div class="ev-actions" style="margin-top:12px;">
+						<button type="button" class="danger" data-action="approve-pending">Approve pending action(s)</button>
+					</div>
+				</div>
 				<pre class="ev-plan" data-role="plan"></pre>
 				<div class="ev-meta"><span data-role="change-id"></span><span data-role="base-head"></span></div>
 			</div>
@@ -159,6 +175,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		var actionUrl = <?php echo $actionUrlJson ?: '"index.php?name=evolutionaction&out=json"'; ?>;
 		var health = <?php echo $healthJson ?: '{}'; ?>;
 		var currentChangeId = '';
+		var currentResumeHandle = '';
 
 		function el(role) { return root.querySelector('[data-role="' + role + '"]'); }
 		function button(action) { return root.querySelector('[data-action="' + action + '"]'); }
@@ -182,6 +199,51 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 		function escapeHtml(value) {
 			return String(value).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[c]; });
 		}
+		function clearApproval() {
+			currentResumeHandle = '';
+			el('approval-requests').innerHTML = '';
+			el('approval-panel').classList.remove('visible');
+		}
+		function renderApproval(result) {
+			currentResumeHandle = result.resume_handle || '';
+			var requests = Array.isArray(result.interaction_requests) ? result.interaction_requests : [];
+			var markup = '';
+			requests.forEach(function(request) {
+				var summary = request && request.summary && typeof request.summary === 'object' ? request.summary : {};
+				var summaryMarkup = '';
+				Object.keys(summary).forEach(function(key) {
+					summaryMarkup += '<div class="ev-approval-key">' + escapeHtml(key) + '</div><div class="ev-approval-value">' + escapeHtml(summary[key]) + '</div>';
+				});
+				markup += '<div class="ev-approval-request">' +
+					'<div><strong>' + escapeHtml(request.title || request.action || 'Pending action') + '</strong></div>' +
+					'<div class="ev-status-text">tool: ' + escapeHtml(request.action || '') + ' · risk: ' + escapeHtml(request.risk || 'medium') + '</div>' +
+					'<div style="margin-top:6px;">' + escapeHtml(request.message || '') + '</div>' +
+					(summaryMarkup ? '<div class="ev-approval-summary">' + summaryMarkup + '</div>' : '') +
+				'</div>';
+			});
+			el('approval-requests').innerHTML = markup;
+			el('approval-panel').classList.toggle('visible', currentResumeHandle !== '' && requests.length > 0);
+		}
+		function handleApplyResult(result) {
+			if (!result.ok) {
+				message('apply-message', result.message || 'Evolution apply failed.', 'error');
+				if (result.validation) el('diff').textContent = JSON.stringify(result.validation, null, 2);
+				el('result-panel').classList.add('visible');
+				return false;
+			}
+			if (result.status === 'awaiting_approval') {
+				renderApproval(result);
+				message('apply-message', result.message || 'MissionBay approval is required before the pending mutation may run.', 'error');
+				button('apply').disabled = true;
+				return false;
+			}
+			clearApproval();
+			el('diff').textContent = result.diff || (result.changed_paths || []).join('\n');
+			el('result-panel').classList.add('visible');
+			message('result-message', result.message || 'Evolution change applied.', 'ok');
+			message('apply-message', 'Apply completed. Review and commit the resulting Git changes before starting another Apply.', 'ok');
+			return true;
+		}
 		function renderHealth(data) {
 			health = data || {};
 			var checks = health.checks || {};
@@ -200,7 +262,7 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			apply.className = 'ev-pill ' + (health.apply_ready ? 'ok' : 'error');
 			apply.textContent = 'Apply ' + (health.apply_ready ? 'ready' : 'blocked');
 			button('analyze').disabled = !health.analysis_ready;
-			button('apply').disabled = !(health.apply_ready && currentChangeId);
+			button('apply').disabled = !(health.apply_ready && currentChangeId && !currentResumeHandle);
 		}
 		async function call(action, data) {
 			var response = await fetch(actionUrl, {
@@ -237,12 +299,24 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 			finally { setBusy(btn, false, 'Test LLM'); }
 		});
 
+		button('agent-test').addEventListener('click', async function() {
+			var btn = this;
+			message('health-message', '', '');
+			setBusy(btn, true, 'Testing agent...');
+			try {
+				var result = await call('agent_test');
+				message('health-message', result.message || (result.ok ? 'Agent tool-loop test succeeded.' : 'Agent tool-loop test failed.'), result.ok ? 'ok' : 'error');
+			} catch (e) { message('health-message', e.message, 'error'); }
+			finally { setBusy(btn, false, 'Test agent loop'); }
+		});
+
 		button('analyze').addEventListener('click', async function() {
 			var prompt = el('prompt').value.trim();
 			if (!prompt) { message('request-message', 'Describe the requested change first.', 'error'); return; }
 			var btn = this;
 			message('request-message', '', '');
 			message('apply-message', '', '');
+			clearApproval();
 			setBusy(btn, true, 'Analyzing...');
 			try {
 				var result = await call('analyze', {prompt: prompt});
@@ -252,35 +326,44 @@ $actionUrlJson = json_encode($actionUrl, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG |
 				el('change-id').textContent = currentChangeId ? 'change: ' + currentChangeId : '';
 				el('base-head').textContent = result.base_head ? 'base: ' + result.base_head : '';
 				el('plan-panel').classList.add('visible');
-				button('apply').disabled = !(health.apply_ready && currentChangeId);
+				button('apply').disabled = !(health.apply_ready && currentChangeId && !currentResumeHandle);
 				message('request-message', 'Read-only analysis completed. Review the proposed change before Apply.', 'ok');
 			} catch (e) { message('request-message', e.message, 'error'); }
 			finally { setBusy(btn, false, 'Analyze change'); button('analyze').disabled = !health.analysis_ready; }
 		});
 
 		button('apply').addEventListener('click', async function() {
-			if (!currentChangeId) return;
+			if (!currentChangeId || currentResumeHandle) return;
 			var btn = this;
 			var completed = false;
 			message('apply-message', '', '');
 			setBusy(btn, true, 'Applying...');
 			try {
 				var result = await call('apply', {change_id: currentChangeId});
-				if (!result.ok) {
-					message('apply-message', result.message || 'Evolution apply failed.', 'error');
-					if (result.validation) el('diff').textContent = JSON.stringify(result.validation, null, 2);
-					el('result-panel').classList.add('visible');
-					return;
-				}
-				el('diff').textContent = result.diff || (result.changed_paths || []).join('\n');
-				el('result-panel').classList.add('visible');
-				message('result-message', result.message || 'Evolution change applied.', 'ok');
-				message('apply-message', 'Apply completed. Review and commit the resulting Git changes before starting another Apply.', 'ok');
-				completed = true;
+				completed = handleApplyResult(result);
 			} catch (e) { message('apply-message', e.message, 'error'); }
 			finally {
 				btn.textContent = btn.dataset.label || 'Apply approved plan';
-				btn.disabled = completed || !(health.apply_ready && currentChangeId);
+				btn.disabled = completed || !!currentResumeHandle || !(health.apply_ready && currentChangeId);
+			}
+		});
+
+		button('approve-pending').addEventListener('click', async function() {
+			if (!currentChangeId || !currentResumeHandle) return;
+			var btn = this;
+			var completed = false;
+			message('apply-message', '', '');
+			setBusy(btn, true, 'Approving...');
+			try {
+				var result = await call('approve_apply', {
+					change_id: currentChangeId,
+					resume_handle: currentResumeHandle
+				});
+				completed = handleApplyResult(result);
+			} catch (e) { message('apply-message', e.message, 'error'); }
+			finally {
+				btn.textContent = btn.dataset.label || 'Approve pending action(s)';
+				btn.disabled = completed || !currentResumeHandle;
 			}
 		});
 

@@ -83,30 +83,13 @@
             "enabled": true,
             "label": "Evolution",
             "chatmodel": "evolution-chat",
-            "orchestrator_profile": "evolution",
+            "orchestrator_profile": "deliberate",
             "tool_profiles": [
                 "evolution"
             ],
             "memory_profile": "",
             "context_profile": "",
             "system_prompt": ""
-        }
-    },
-    "agent-orchestrator-profile": {
-        "evolution": {
-            "label": "Evolution governed",
-            "description": "Long-running governed orchestration for BASE3 source analysis and approved mutations.",
-            "enabled": true,
-            "mode": "governed",
-            "max_tool_loops": 32,
-            "model_decision": {
-                "strategy": "native-model-decision",
-                "repair_enabled": false,
-                "confidence_threshold": 0.7
-            },
-            "optional_stages": {
-                "semantic-verification": false
-            }
         }
     }
 }

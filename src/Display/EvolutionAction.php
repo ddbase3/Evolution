@@ -36,8 +36,13 @@ final class EvolutionAction implements IOutput {
 			$result = match($action) {
 				'health' => $this->healthService->check(),
 				'llm_test' => $this->agentService->testLlm(),
+				'agent_test' => $this->agentService->testAgent(),
 				'analyze' => $this->agentService->analyze((string)($data['prompt'] ?? '')),
 				'apply' => $this->agentService->apply((string)($data['change_id'] ?? '')),
+				'approve_apply' => $this->agentService->approveApply(
+					(string)($data['change_id'] ?? ''),
+					(string)($data['resume_handle'] ?? '')
+				),
 				default => [
 					'ok' => false,
 					'message' => 'Unknown Evolution action: ' . ($action !== '' ? $action : '(empty)')

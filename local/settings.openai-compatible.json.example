@@ -2,16 +2,16 @@
     "connection": {
         "evolution-llm": {
             "id": "evolution-llm",
-            "name": "Evolution OpenAI",
+            "name": "Evolution OpenAI-Compatible LLM",
             "type": "http",
             "driver": "http",
-            "baseUrl": "https://api.openai.com",
+            "baseUrl": "https://your-openai-compatible-endpoint.example",
             "auth": {
                 "type": "bearer",
                 "headerName": "Authorization",
                 "secret": {
                     "mode": "file",
-                    "path": "/srv/www/html/misc/evolution/local/secret/openai.key"
+                    "path": "/srv/www/html/misc/evolution/local/secret/evolution-llm.key"
                 }
             },
             "timeoutSeconds": 120,
@@ -23,11 +23,11 @@
     "service-llm": {
         "evolution-llm": {
             "id": "evolution-llm",
-            "name": "Evolution OpenAI",
+            "name": "Evolution OpenAI-Compatible LLM",
             "serviceType": "llm",
             "connection": "evolution-llm",
-            "driver": "openai-chat",
-            "model": "gpt-4.1",
+            "driver": "openai-compatible-chat",
+            "model": "replace-with-provider-model-id",
             "enabled": true,
             "options": {
                 "temperature": 0.2,

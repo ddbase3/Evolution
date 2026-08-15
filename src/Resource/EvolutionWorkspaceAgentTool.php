@@ -141,7 +141,7 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 				'description' => $description,
 				'parameters' => [
 					'type' => 'object',
-					'properties' => $properties,
+					'properties' => $properties !== [] ? $properties : new \stdClass(),
 					'required' => $required
 				]
 			]
@@ -158,17 +158,16 @@ final class EvolutionWorkspaceAgentTool extends AbstractAgentResource implements
 			'priority' => 100,
 			'readOnlyHint' => false,
 			'mutation' => true,
-			'requiresApproval' => false,
+			'requiresApproval' => true,
 			'commitGuardRequired' => false,
 			'sideEffectHint' => true,
-			// The explicit Evolution Apply action is the user approval boundary.
 			'destructiveHint' => false,
 			'function' => [
 				'name' => $name,
 				'description' => $description,
 				'parameters' => [
 					'type' => 'object',
-					'properties' => $properties,
+					'properties' => $properties !== [] ? $properties : new \stdClass(),
 					'required' => $required
 				]
 			]

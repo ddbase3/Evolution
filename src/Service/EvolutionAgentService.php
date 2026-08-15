@@ -4,6 +4,9 @@ namespace Evolution\Service;
 
 use AssistantFoundation\Dto\AgentExecutionRequest;
 use AssistantFoundation\Dto\AgentExecutionResult;
+use AssistantFoundation\Dto\AgentInteractionRequest;
+use AssistantFoundation\Dto\AgentInteractionResponse;
+use AssistantFoundation\Dto\AgentResume;
 use Base3\Api\IContainer;
 use Base3\Settings\Api\ISettingsStore;
 use Base3\State\Api\IStateStore;
@@ -37,8 +40,8 @@ final class EvolutionAgentService {
 			throw new RuntimeException('Evolution analysis is not ready. Resolve the failing self-checks first.');
 		}
 
-		$baseGitSnapshot = $this->configuration->isGitRequired() ? $this->workspace->createGitSnapshot() : [];
-		$baseHead = trim((string)($baseGitSnapshot['repositories']['.'] ?? ''));
+		$baseSourceFingerprint = $this->workspace->createSourceFingerprint();
+		$baseHead = $this->configuration->isGitRequired() ? $this->workspace->getGitHead() : '';
 		$result = $this->executeAgent(
 			'analyze',
 			$this->buildAnalyzeInstruction($prompt),
@@ -47,6 +50,7 @@ final class EvolutionAgentService {
 				'evolution_workspace' => $this->configuration->getWorkspace()
 			]
 		);
+		$this->assertSuccessfulAgentResult($result, 'analysis');
 
 		$plan = trim($this->extractAssistantText($result));
 		if ($plan === '') {
@@ -61,7 +65,7 @@ final class EvolutionAgentService {
 			'prompt' => $prompt,
 			'plan' => $plan,
 			'base_head' => $baseHead,
-			'base_git_snapshot' => $baseGitSnapshot,
+			'base_source_fingerprint' => $baseSourceFingerprint,
 			'created_at' => time(),
 			'warnings' => $result->getWarnings()
 		], self::CHANGE_TTL_SECONDS);
@@ -77,10 +81,7 @@ final class EvolutionAgentService {
 
 	/** @return array<string,mixed> */
 	public function apply(string $changeId): array {
-		$changeId = strtolower(trim($changeId));
-		if (!preg_match('/^[a-f0-9]{24}$/', $changeId)) {
-			throw new RuntimeException('Invalid Evolution change id.');
-		}
+		$changeId = $this->normalizeChangeId($changeId);
 
 		$health = $this->health->check();
 		if (($health['apply_ready'] ?? false) !== true) {
@@ -88,103 +89,113 @@ final class EvolutionAgentService {
 		}
 
 		$state = $this->requireStateStore();
-		$change = $state->get(self::CHANGE_KEY_PREFIX . $changeId);
-		if (!is_array($change) || ($change['id'] ?? '') !== $changeId) {
-			throw new RuntimeException('Evolution change plan was not found or has expired: ' . $changeId);
-		}
+		$change = $this->loadChange($state, $changeId);
 		if (($change['status'] ?? '') !== 'planned') {
 			throw new RuntimeException('Evolution change is not in planned state: ' . (string)($change['status'] ?? 'unknown'));
 		}
 
-		if (!$state->setIfNotExists(self::APPLY_LOCK_KEY, [
-			'change_id' => $changeId,
-			'started_at' => time()
-		], self::APPLY_LOCK_TTL_SECONDS)) {
-			throw new RuntimeException('Another Evolution apply operation is already running.');
-		}
-
-		$baseGitSnapshot = is_array($change['base_git_snapshot'] ?? null) ? $change['base_git_snapshot'] : [];
+		$this->acquireApplyLock($state, $changeId);
+		$baseGitSnapshot = [];
 		try {
-			$this->assertAcceptedBase($baseGitSnapshot);
-			$state->set(self::CHANGE_KEY_PREFIX . $changeId, array_merge($change, [
+			$this->workspace->assertSourceFingerprint(trim((string)($change['base_source_fingerprint'] ?? '')));
+			$baseGitSnapshot = $this->configuration->isGitRequired() ? $this->workspace->createGitSnapshot() : [];
+			$change = array_merge($change, [
 				'status' => 'applying',
-				'apply_started_at' => time()
-			]), self::CHANGE_TTL_SECONDS);
+				'apply_started_at' => time(),
+				'base_git_snapshot' => $baseGitSnapshot
+			]);
+			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
 
 			$result = $this->executeAgent(
 				'apply',
 				$this->buildApplyInstruction($change),
-				[
-					'evolution_mode' => 'apply',
-					'evolution_change_id' => $changeId,
-					'evolution_workspace' => $this->configuration->getWorkspace()
-				]
+				$this->buildApplyContext($changeId)
 			);
 
-			$changedPaths = $this->configuration->isGitRequired() ? $this->workspace->getChangedPaths() : [];
-			if ($this->configuration->isGitRequired() && $changedPaths === []) {
-				throw new RuntimeException('Apply completed without source changes. The approved plan was not implemented.');
+			if ($result->getAgentResult()?->isSuspended()) {
+				return $this->storeSuspendedApply($state, $change, $changeId, $result);
 			}
 
-			$validation = $this->validateAppliedChange();
-			if (($validation['ok'] ?? false) !== true) {
-				$rollback = $this->rollbackFailedChange($baseGitSnapshot);
-				$failed = array_merge($change, [
-					'status' => 'failed',
-					'apply_finished_at' => time(),
-					'validation' => $validation,
-					'rollback' => $rollback,
-					'agent_output' => $this->extractAssistantText($result),
-					'warnings' => $result->getWarnings()
-				]);
-				$state->set(self::CHANGE_KEY_PREFIX . $changeId, $failed, self::CHANGE_TTL_SECONDS);
-				return [
-					'ok' => false,
-					'message' => 'Generated change failed validation and was reverted to the accepted Git revision.',
-					'validation' => $validation,
-					'rollback' => $rollback,
-					'warnings' => $result->getWarnings()
-				];
-			}
-
-			$diff = $this->configuration->isGitRequired() ? $this->workspace->getGitDiff() : '';
-			$done = array_merge($change, [
-				'status' => 'applied',
-				'apply_finished_at' => time(),
-				'validation' => $validation,
-				'changed_paths' => $changedPaths,
-				'agent_output' => $this->extractAssistantText($result),
-				'warnings' => $result->getWarnings()
-			]);
-			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $done, self::CHANGE_TTL_SECONDS);
-
-			return [
-				'ok' => true,
-				'message' => 'Approved Evolution change was applied and validated.',
-				'change_id' => $changeId,
-				'changed_paths' => $changedPaths,
-				'diff' => $diff,
-				'validation' => $validation,
-				'agent_output' => $this->extractAssistantText($result),
-				'warnings' => $result->getWarnings()
-			];
+			$this->assertSuccessfulAgentResult($result, 'apply');
+			return $this->finalizeAppliedChange($state, $change, $changeId, $result, $baseGitSnapshot);
 		} catch (Throwable $e) {
-			$rollback = null;
-			if ($this->configuration->isGitRequired() && $baseGitSnapshot !== [] && !$this->workspace->isGitClean()) {
-				$rollback = $this->rollbackFailedChange($baseGitSnapshot);
-			}
-			$state->set(self::CHANGE_KEY_PREFIX . $changeId, array_merge($change, [
-				'status' => 'failed',
-				'apply_finished_at' => time(),
-				'error' => $e->getMessage(),
-				'rollback' => $rollback
-			]), self::CHANGE_TTL_SECONDS);
+			$this->markApplyFailed($state, $change, $changeId, $baseGitSnapshot, $e);
 			throw new RuntimeException($e->getMessage(), 0, $e);
 		} finally {
-			try {
-				$state->delete(self::APPLY_LOCK_KEY);
-			} catch (Throwable) {
+			$this->releaseApplyLock($state);
+		}
+	}
+
+	/** @return array<string,mixed> */
+	public function approveApply(string $changeId, string $resumeHandle): array {
+		$changeId = $this->normalizeChangeId($changeId);
+		$resumeHandle = trim($resumeHandle);
+		if ($resumeHandle === '') {
+			throw new RuntimeException('Missing MissionBay resume handle for Evolution approval.');
+		}
+
+		$state = $this->requireStateStore();
+		$change = $this->loadChange($state, $changeId);
+		if (($change['status'] ?? '') !== 'awaiting_approval') {
+			throw new RuntimeException('Evolution change is not awaiting approval: ' . (string)($change['status'] ?? 'unknown'));
+		}
+		$storedHandle = trim((string)($change['resume_handle'] ?? ''));
+		if ($storedHandle === '' || !hash_equals($storedHandle, $resumeHandle)) {
+			throw new RuntimeException('Evolution approval resume handle does not match the pending change.');
+		}
+
+		$requests = is_array($change['interaction_requests'] ?? null) ? $change['interaction_requests'] : [];
+		if ($requests === []) {
+			throw new RuntimeException('Evolution change has no pending MissionBay approval requests.');
+		}
+
+		$responses = [];
+		foreach ($requests as $request) {
+			if (!is_array($request)) {
+				throw new RuntimeException('Stored MissionBay approval request is invalid.');
 			}
+			$requestId = trim((string)($request['id'] ?? ''));
+			$kind = trim((string)($request['kind'] ?? ''));
+			if ($requestId === '' || $kind !== AgentInteractionRequest::KIND_APPROVAL) {
+				throw new RuntimeException('Evolution v1 can resume only explicit MissionBay approval requests.');
+			}
+			$responses[] = new AgentInteractionResponse(
+				$requestId,
+				AgentInteractionResponse::DECISION_APPROVE
+			);
+		}
+
+		$this->acquireApplyLock($state, $changeId);
+		$baseGitSnapshot = is_array($change['base_git_snapshot'] ?? null) ? $change['base_git_snapshot'] : [];
+		try {
+			$this->workspace->assertSourceFingerprint(trim((string)($change['resume_source_fingerprint'] ?? '')));
+			$resume = new AgentResume($resumeHandle, $responses);
+			$change = array_merge($change, [
+				'status' => 'applying',
+				'resume_handle' => '',
+				'interaction_requests' => [],
+				'resume_started_at' => time()
+			]);
+			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
+
+			$result = $this->executeAgent(
+				'apply',
+				'Continue the approved Evolution apply operation from the persisted MissionBay suspension.',
+				$this->buildApplyContext($changeId),
+				$resume
+			);
+
+			if ($result->getAgentResult()?->isSuspended()) {
+				return $this->storeSuspendedApply($state, $change, $changeId, $result);
+			}
+
+			$this->assertSuccessfulAgentResult($result, 'apply resume');
+			return $this->finalizeAppliedChange($state, $change, $changeId, $result, $baseGitSnapshot);
+		} catch (Throwable $e) {
+			$this->markApplyFailed($state, $change, $changeId, $baseGitSnapshot, $e);
+			throw new RuntimeException($e->getMessage(), 0, $e);
+		} finally {
+			$this->releaseApplyLock($state);
 		}
 	}
 
@@ -193,7 +204,53 @@ final class EvolutionAgentService {
 		return $this->health->testLlm();
 	}
 
-	private function executeAgent(string $mode, string $instruction, array $context): AgentExecutionResult {
+	/** @return array<string,mixed> */
+	public function testAgent(): array {
+		$health = $this->health->check();
+		if (($health['analysis_ready'] ?? false) !== true) {
+			return [
+				'ok' => false,
+				'message' => 'Agent tool-loop test is unavailable until the required Evolution analysis checks pass.'
+			];
+		}
+
+		$result = $this->executeAgent(
+			'analyze',
+			'Diagnostic run only. Call evolution_workspace_info exactly once. After the tool result, reply exactly with EVOLUTION_AGENT_OK. Do not call mutation tools.',
+			[
+				'evolution_mode' => 'analyze',
+				'evolution_workspace' => $this->configuration->getWorkspace(),
+				'evolution_diagnostic' => true
+			]
+		);
+		$this->assertSuccessfulAgentResult($result, 'tool-loop test');
+
+		$agentResult = $result->getAgentResult();
+		$execution = $agentResult?->getState()->getExecution();
+		$toolCalls = $execution?->getExecutedToolCalls() ?? [];
+		if ($toolCalls === []) {
+			return [
+				'ok' => false,
+				'message' => 'MissionBay agent completed the diagnostic without executing a tool. The configured model did not exercise the tool loop.'
+			];
+		}
+
+		$text = trim($this->extractAssistantText($result));
+		return [
+			'ok' => $text === 'EVOLUTION_AGENT_OK',
+			'message' => $text === 'EVOLUTION_AGENT_OK'
+				? 'MissionBay agent tool loop succeeded.'
+				: 'MissionBay agent tool loop executed, but the diagnostic final response was unexpected: ' . ($text !== '' ? $text : '(empty)'),
+			'tool_calls' => count($toolCalls)
+		];
+	}
+
+	private function executeAgent(
+		string $mode,
+		string $instruction,
+		array $context,
+		?AgentResume $resume = null
+	): AgentExecutionResult {
 		$settingsStore = $this->requireSettingsStore();
 		$agentId = $this->configuration->getAgentId();
 		$agentSettings = $settingsStore->get('agent', $agentId, []);
@@ -212,16 +269,16 @@ final class EvolutionAgentService {
 			throw new RuntimeException('MissionBay AgentExecutionService is not available.');
 		}
 
-		$request = new AgentExecutionRequest(
-			$agentSettings,
-			[
-				'system' => $effectiveSystemPrompt,
-				'prompt' => $instruction,
-				'mode' => $mode
-			],
-			$context
-		);
+		$inputs = [
+			'system' => $effectiveSystemPrompt,
+			'prompt' => $instruction,
+			'mode' => $mode
+		];
+		if ($resume instanceof AgentResume) {
+			$inputs['resume'] = $resume->toArray();
+		}
 
+		$request = new AgentExecutionRequest($agentSettings, $inputs, $context);
 		return $executionService->execute($request);
 	}
 
@@ -241,6 +298,217 @@ final class EvolutionAgentService {
 			. "\n\nInspect the actual source, BASE3 structure, relevant settings and database schema with the available read-only tools. "
 			. "Return a concrete implementation plan: affected plugin/domain, files to create/change/delete, service or ClassMap impact, database migration impact, data-safety concerns and validation steps. "
 			. "If the request cannot be implemented safely with the available information, state the exact blocking reason instead of inventing an architecture.";
+	}
+
+	/** @return array<string,mixed> */
+	private function storeSuspendedApply(
+		IStateStore $state,
+		array $change,
+		string $changeId,
+		AgentExecutionResult $result
+	): array {
+		$agentResult = $result->getAgentResult();
+		$suspension = $agentResult?->getState()->getSuspension();
+		if ($agentResult === null || !$agentResult->isSuspended() || $suspension === null || !$suspension->isSuspended()) {
+			throw new RuntimeException('MissionBay reported a suspended Evolution run without suspension state.');
+		}
+		if ($suspension->getStatus() !== 'awaiting_approval') {
+			throw new RuntimeException('Evolution v1 supports only MissionBay approval suspensions, received: ' . $suspension->getStatus());
+		}
+
+		$resumeHandle = trim($suspension->getResumeHandle());
+		if ($resumeHandle === '') {
+			throw new RuntimeException('MissionBay approval suspension has no resume handle.');
+		}
+
+		$publicRequests = [];
+		$storedRequests = [];
+		foreach ($suspension->getInteractionRequests() as $request) {
+			if (!$request instanceof AgentInteractionRequest) {
+				throw new RuntimeException('MissionBay approval suspension contains an invalid interaction request.');
+			}
+			if ($request->getKind() !== AgentInteractionRequest::KIND_APPROVAL) {
+				throw new RuntimeException('Evolution v1 supports only explicit MissionBay approval requests.');
+			}
+			$storedRequests[] = [
+				'id' => $request->getId(),
+				'kind' => $request->getKind()
+			];
+			$publicRequests[] = [
+				'id' => $request->getId(),
+				'kind' => $request->getKind(),
+				'action' => $request->getAction()->getName(),
+				'title' => $request->getTitle(),
+				'message' => $request->getMessage(),
+				'summary' => $this->normalizeApprovalSummary($request->getSummary()),
+				'risk' => $request->getRisk()
+			];
+		}
+		if ($storedRequests === []) {
+			throw new RuntimeException('MissionBay approval suspension contains no interaction requests.');
+		}
+
+		$change = array_merge($change, [
+			'status' => 'awaiting_approval',
+			'resume_handle' => $resumeHandle,
+			'interaction_requests' => $storedRequests,
+			'resume_source_fingerprint' => $this->workspace->createSourceFingerprint(),
+			'approval_requested_at' => time(),
+			'warnings' => $result->getWarnings()
+		]);
+		$state->set(self::CHANGE_KEY_PREFIX . $changeId, $change, self::CHANGE_TTL_SECONDS);
+
+		return [
+			'ok' => true,
+			'status' => 'awaiting_approval',
+			'message' => 'MissionBay requires approval for the concrete pending source mutation before execution.',
+			'change_id' => $changeId,
+			'resume_handle' => $resumeHandle,
+			'interaction_requests' => $publicRequests,
+			'warnings' => $result->getWarnings()
+		];
+	}
+
+	/** @param array<string,mixed> $summary @return array<string,mixed> */
+	private function normalizeApprovalSummary(array $summary): array {
+		$result = [];
+		foreach ($summary as $key => $value) {
+			if (is_scalar($value) || $value === null) {
+				$text = $value === null ? 'Not specified' : (string)$value;
+				$result[(string)$key] = strlen($text) > 1200 ? substr($text, 0, 1200) . '…' : $text;
+				continue;
+			}
+			$json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+			$text = is_string($json) ? $json : get_debug_type($value);
+			$result[(string)$key] = strlen($text) > 1200 ? substr($text, 0, 1200) . '…' : $text;
+		}
+		return $result;
+	}
+
+	/** @param array<string,mixed> $change @param array<string,mixed> $baseGitSnapshot @return array<string,mixed> */
+	private function finalizeAppliedChange(
+		IStateStore $state,
+		array $change,
+		string $changeId,
+		AgentExecutionResult $result,
+		array $baseGitSnapshot
+	): array {
+		$changedPaths = $this->configuration->isGitRequired() ? $this->workspace->getChangedPaths() : [];
+		if ($this->configuration->isGitRequired() && $changedPaths === []) {
+			throw new RuntimeException('Apply completed without source changes. The approved plan was not implemented.');
+		}
+
+		$validation = $this->validateAppliedChange();
+		if (($validation['ok'] ?? false) !== true) {
+			$rollback = $this->rollbackFailedChange($baseGitSnapshot);
+			$failed = array_merge($change, [
+				'status' => 'failed',
+				'apply_finished_at' => time(),
+				'validation' => $validation,
+				'rollback' => $rollback,
+				'agent_output' => $this->extractAssistantText($result),
+				'warnings' => $result->getWarnings(),
+				'resume_handle' => '',
+				'interaction_requests' => []
+			]);
+			$state->set(self::CHANGE_KEY_PREFIX . $changeId, $failed, self::CHANGE_TTL_SECONDS);
+			return [
+				'ok' => false,
+				'message' => 'Generated change failed validation and was reverted to the accepted Git revision.',
+				'validation' => $validation,
+				'rollback' => $rollback,
+				'warnings' => $result->getWarnings()
+			];
+		}
+
+		$diff = $this->configuration->isGitRequired() ? $this->workspace->getGitDiff() : '';
+		$done = array_merge($change, [
+			'status' => 'applied',
+			'apply_finished_at' => time(),
+			'validation' => $validation,
+			'changed_paths' => $changedPaths,
+			'agent_output' => $this->extractAssistantText($result),
+			'warnings' => $result->getWarnings(),
+			'resume_handle' => '',
+			'interaction_requests' => []
+		]);
+		$state->set(self::CHANGE_KEY_PREFIX . $changeId, $done, self::CHANGE_TTL_SECONDS);
+
+		return [
+			'ok' => true,
+			'status' => 'applied',
+			'message' => 'Approved Evolution change was applied and validated.',
+			'change_id' => $changeId,
+			'changed_paths' => $changedPaths,
+			'diff' => $diff,
+			'validation' => $validation,
+			'agent_output' => $this->extractAssistantText($result),
+			'warnings' => $result->getWarnings()
+		];
+	}
+
+	/** @param array<string,mixed> $change @param array<string,mixed> $baseGitSnapshot */
+	private function markApplyFailed(
+		IStateStore $state,
+		array $change,
+		string $changeId,
+		array $baseGitSnapshot,
+		Throwable $error
+	): void {
+		$rollback = null;
+		if ($this->configuration->isGitRequired() && $baseGitSnapshot !== [] && !$this->workspace->isGitClean()) {
+			$rollback = $this->rollbackFailedChange($baseGitSnapshot);
+		}
+		$state->set(self::CHANGE_KEY_PREFIX . $changeId, array_merge($change, [
+			'status' => 'failed',
+			'apply_finished_at' => time(),
+			'error' => $error->getMessage(),
+			'rollback' => $rollback,
+			'resume_handle' => '',
+			'interaction_requests' => []
+		]), self::CHANGE_TTL_SECONDS);
+	}
+
+	/** @return array<string,mixed> */
+	private function buildApplyContext(string $changeId): array {
+		return [
+			'evolution_mode' => 'apply',
+			'evolution_change_id' => $changeId,
+			'evolution_workspace' => $this->configuration->getWorkspace()
+		];
+	}
+
+	private function normalizeChangeId(string $changeId): string {
+		$changeId = strtolower(trim($changeId));
+		if (!preg_match('/^[a-f0-9]{24}$/', $changeId)) {
+			throw new RuntimeException('Invalid Evolution change id.');
+		}
+		return $changeId;
+	}
+
+	/** @return array<string,mixed> */
+	private function loadChange(IStateStore $state, string $changeId): array {
+		$change = $state->get(self::CHANGE_KEY_PREFIX . $changeId);
+		if (!is_array($change) || ($change['id'] ?? '') !== $changeId) {
+			throw new RuntimeException('Evolution change plan was not found or has expired: ' . $changeId);
+		}
+		return $change;
+	}
+
+	private function acquireApplyLock(IStateStore $state, string $changeId): void {
+		if (!$state->setIfNotExists(self::APPLY_LOCK_KEY, [
+			'change_id' => $changeId,
+			'started_at' => time()
+		], self::APPLY_LOCK_TTL_SECONDS)) {
+			throw new RuntimeException('Another Evolution apply operation is already running.');
+		}
+	}
+
+	private function releaseApplyLock(IStateStore $state): void {
+		try {
+			$state->delete(self::APPLY_LOCK_KEY);
+		} catch (Throwable) {
+		}
 	}
 
 	/** @return array<string,mixed> */
@@ -275,31 +543,103 @@ final class EvolutionAgentService {
 		return $rollback;
 	}
 
-	/** @param array<string,mixed> $baseGitSnapshot */
-	private function assertAcceptedBase(array $baseGitSnapshot): void {
-		if (!$this->configuration->isGitRequired()) {
-			return;
+	private function assertSuccessfulAgentResult(AgentExecutionResult $result, string $phase): void {
+		$agentResult = $result->getAgentResult();
+		if ($agentResult !== null && $agentResult->hasFailure()) {
+			$resultState = $agentResult->getState()->getResult();
+			$failureCode = trim((string)($resultState?->getFailureCode() ?? ''));
+			$failureMessage = trim((string)($resultState?->getFailureMessage() ?? ''));
+			$failureDetail = $resultState?->getFailureDetail() ?? [];
+
+			if ($failureMessage === '') {
+				$metadata = $agentResult->getMetadata();
+				$failureMessage = trim((string)($metadata['error'] ?? $metadata['message'] ?? 'Agent runtime reported a failed execution.'));
+			}
+
+			$parts = ['MissionBay agent ' . $phase . ' failed'];
+			if ($failureCode !== '') {
+				$parts[0] .= ' [' . $failureCode . ']';
+			}
+			$parts[0] .= ': ' . $failureMessage;
+
+			$detail = $this->formatFailureDetail($failureDetail);
+			if ($detail !== '') {
+				$parts[] = 'Detail: ' . $detail;
+			}
+
+			throw new RuntimeException(implode("\n", $parts));
 		}
-		$this->workspace->assertGitSnapshot($baseGitSnapshot);
+
+		$output = $result->getOutput();
+		$assistant = is_array($output['assistant'] ?? null) ? $output['assistant'] : [];
+		$error = $assistant['error'] ?? ($output['error'] ?? null);
+		if (is_scalar($error) && trim((string)$error) !== '') {
+			throw new RuntimeException('MissionBay agent ' . $phase . ' failed: ' . trim((string)$error));
+		}
+
+		$warning = is_scalar($assistant['warning'] ?? null)
+			? trim((string)$assistant['warning'])
+			: '';
+		if ($warning !== '') {
+			$status = is_scalar($assistant['status'] ?? null)
+				? trim((string)$assistant['status'])
+				: ($agentResult?->getStatus() ?? 'unknown');
+			throw new RuntimeException(
+				'MissionBay agent ' . $phase . ' did not produce a complete final response [' . $warning . ']. '
+				. 'Status: ' . ($status !== '' ? $status : 'unknown') . '. No Evolution change plan was stored.'
+			);
+		}
+
+		if ($agentResult !== null && !$agentResult->isCompleted()) {
+			throw new RuntimeException(
+				'MissionBay agent ' . $phase . ' ended with non-terminal status: ' . $agentResult->getStatus() . '.'
+			);
+		}
+	}
+
+	/** @param array<string,mixed> $detail */
+	private function formatFailureDetail(array $detail): string {
+		if ($detail === []) {
+			return '';
+		}
+
+		$message = $detail['message'] ?? null;
+		if (is_scalar($message) && trim((string)$message) !== '') {
+			return trim((string)$message);
+		}
+
+		$json = json_encode($detail, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+		if (!is_string($json) || $json === '{}' || $json === 'null') {
+			return '';
+		}
+
+		return $json;
 	}
 
 	private function extractAssistantText(AgentExecutionResult $result): string {
+		$this->assertSuccessfulAgentResult($result, 'execution');
+
 		$output = $result->getOutput();
 		$agentResult = $result->getAgentResult();
-		if ($agentResult !== null && $agentResult->getOutput() !== []) {
+		if ($output === [] && $agentResult !== null) {
 			$output = $agentResult->getOutput();
 		}
 
 		$assistant = is_array($output['assistant'] ?? null) ? $output['assistant'] : [];
 		$message = $assistant['message'] ?? null;
 		if (is_array($message)) {
-			$content = $message['content'] ?? '';
-			if (is_scalar($content)) {
-				return trim((string)$content);
+			$content = $this->normalizeMessageContent($message['content'] ?? null);
+			if ($content !== '') {
+				return trim($content);
 			}
 		}
 		if (is_scalar($message)) {
 			return trim((string)$message);
+		}
+
+		$content = $this->normalizeMessageContent($assistant['content'] ?? null);
+		if ($content !== '') {
+			return trim($content);
 		}
 
 		$error = $assistant['error'] ?? ($output['error'] ?? null);
@@ -307,7 +647,46 @@ final class EvolutionAgentService {
 			throw new RuntimeException('MissionBay agent failed: ' . trim((string)$error));
 		}
 
-		return trim((string)($assistant['content'] ?? ''));
+		if ($agentResult?->hasFailure()) {
+			$metadata = $agentResult->getMetadata();
+			$error = trim((string)($metadata['error'] ?? $metadata['message'] ?? 'Agent runtime reported a failed execution.'));
+			throw new RuntimeException('MissionBay agent failed: ' . $error);
+		}
+
+		$terminalNodes = array_values(array_filter(
+			array_map('strval', array_keys($output)),
+			static fn(string $nodeId): bool => $nodeId !== ''
+		));
+		$status = $agentResult?->getStatus() ?? 'unknown';
+		$details = $terminalNodes === []
+			? 'No terminal node output was returned.'
+			: 'Terminal nodes: ' . implode(', ', $terminalNodes) . '.';
+
+		throw new RuntimeException(
+			'MissionBay agent returned no assistant message. Status: ' . $status . '. ' . $details
+		);
+	}
+
+	private function normalizeMessageContent(mixed $content): string {
+		if ($content === null) {
+			return '';
+		}
+
+		if (is_string($content)) {
+			return $content;
+		}
+
+		if (is_bool($content)) {
+			return $content ? 'true' : 'false';
+		}
+
+		if (is_int($content) || is_float($content)) {
+			return (string)$content;
+		}
+
+		$json = json_encode($content, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+		return is_string($json) && $json !== 'null' ? $json : '';
 	}
 
 	private function loadSystemPrompt(): string {
